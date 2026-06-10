@@ -96,6 +96,16 @@ function formatearReserva(reserva) {
 async function enviarTemplate(to, templateName, variables = []) {
   const cleanPhone = String(to).replace(/\D/g, '');
 
+  // 👇 EL INTERCEPTOR MÁGICO PARA CAPELLI 👇
+  // Traduce los nombres genéricos de BarberGo a los nombres exactos de la cuenta de Capelli
+  if (templateName === 'solicitud_reserva_v3') {
+    templateName = 'solicitud_reserva_v3_';
+  }
+  if (templateName === 'calificar_barbero_v2') {
+    templateName = 'calificar_barbero'; 
+  }
+  // 👆======================================👆
+
   const payload = {
     messaging_product: 'whatsapp',
     to: cleanPhone,
