@@ -1,7 +1,7 @@
 {
   "name": "barbergo-whatsapp-api-capelli",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "server_capelli.js",
   "scripts": {
     "start": "node server.js"
   },

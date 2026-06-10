@@ -170,7 +170,6 @@ async function enviarCalificacionWhatsApp(reserva) {
 }
 
 async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
-  // Verificar plan Premium de Capelli
   try {
     const snap = await db.collection('companies').doc(COMPANY_ID).get();
     if (!snap.exists || snap.data().plan?.toLowerCase() !== 'premium') {
@@ -215,6 +214,27 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 });
 
 // ========================================
+// NOTIFICAR CANCELACIÓN DESDE PANEL ADMIN
+// ========================================
+app.post('/api/admin-notificar-cancelacion', async (req, res) => {
+  try {
+    const { reserva } = req.body;
+
+    if (!reserva?.client?.phone) {
+      return res.status(400).json({ success: false, error: 'Faltan datos de la reserva o del cliente' });
+    }
+
+    const numeroMeta = normalizarNumeroPY(reserva.client.phone);
+    await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta);
+    return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado' });
+
+  } catch (error) {
+    console.error('❌ Error en /api/admin-notificar-cancelacion:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ========================================
 // RESERVA COMPLETADA → CALIFICACIÓN
 // ========================================
 app.post('/api/reserva-completada', async (req, res) => {
@@ -235,7 +255,6 @@ app.post('/api/reserva-completada', async (req, res) => {
 
     const bookingRef = db.collection('bookings').doc(bookingId);
 
-    // Verificar plan Premium
     let premium = false;
     try {
       const compSnap = await db.collection('companies').doc(COMPANY_ID).get();
@@ -365,7 +384,6 @@ app.post('/webhook', async (req, res) => {
                 continue;
               }
 
-              // Buscar referencia del barbero
               let barberRef = null;
               const directSnap = await db
                 .collection('locations').doc(locationId)
@@ -520,7 +538,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ========================================
-// CRON: RECORDATORIOS 3 HORAS ANTES
+// CRON: RECORDATORIOS 2 HORAS ANTES
 // ========================================
 cron.schedule('*/15 * * * *', async () => {
   console.log('⏳ [Capelli CRON] Revisando recordatorios...');
@@ -547,8 +565,9 @@ cron.schedule('*/15 * * * *', async () => {
       bookingTime.setHours(h, m, 0, 0);
       const diffMinutes = Math.floor((bookingTime - now) / 60000);
 
-      if (diffMinutes >= 165 && diffMinutes <= 195) {
-        console.log(`🎯 [Capelli] Recordatorio → ${reserva.client?.name} (${timeStr})`);
+      // Ventana: entre 105 y 135 minutos antes (2hs ± 15min por el intervalo del cron)
+      if (diffMinutes >= 105 && diffMinutes <= 135) {
+        console.log(`🎯 [Capelli] Recordatorio 2hs → ${reserva.client?.name} (${timeStr})`);
         await db.collection('bookings').doc(doc.id).update({
           reminderSent: true,
           updatedAt: admin.firestore.FieldValue.serverTimestamp()
