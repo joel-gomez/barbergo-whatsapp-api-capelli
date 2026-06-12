@@ -80,37 +80,21 @@ function formatearReserva(reserva) {
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
-// ========================================
-// ENVIAR TEMPLATE
-// ========================================
-async function enviarTemplate(to, templateName, variables = []) {
-  const cleanPhone = String(to).replace(/\D/g, '');
-  const payload = {
-    messaging_product: 'whatsapp',
-    to: cleanPhone,
-    type: 'template',
-    template: {
-      name: templateName,
-      language: { code: 'es' },
-      ...(variables.length > 0 && {
-        components: [{ type: 'body', parameters: variables.map(v => ({ type: 'text', text: String(v) })) }]
-      })
-    }
-  };
-
-  const response = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
-
-  if (!response.ok) {
-    const err = await response.json();
-    console.error(`❌ [Capelli] Error Meta [${templateName}]:`, err);
-    return false;
-  }
-  console.log(`✅ [Capelli] Template '${templateName}' enviado a ${cleanPhone}`);
-  return true;
+// ELIMINAR todo este bloque del interceptor viejo:
+if (templateName === 'solicitud_reserva_v3') {
+  templateName = 'solicitud_reserva_v3_';
+}
+if (templateName === 'calificar_barbero_v2') {
+  templateName = 'calificar_barbero'; 
+}
+if (templateName === 'reserva_confirmada_v2') {
+  templateName = 'TU_NOMBRE_DE_PLANTILLA_CONFIRMADA_CAPELLI'; 
+}
+if (templateName === 'reserva_cancelada_v3') {
+  templateName = 'TU_NOMBRE_DE_PLANTILLA_CANCELADA_CAPELLI'; 
+}
+if (templateName === 'recordatorio_turno_v4') {
+  templateName = 'TU_NOMBRE_DE_PLANTILLA_RECORDATORIO_CAPELLI'; 
 }
 
 // ========================================
@@ -154,24 +138,30 @@ app.get('/', (req, res) => res.status(200).json({ ok: true, message: 'Capelli Wh
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
     const { phone, templateName, params = [] } = req.body;
-    if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
+
+    if (!phone || !templateName) {
+      return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
+    }
 
     const TEMPLATE_MAP = {
-      'solicitud_reserva_v3':  TEMPLATES.solicitud,
-      'reserva_confirmada_v2': TEMPLATES.confirmada,
-      'reserva_cancelada_v3':  TEMPLATES.cancelada,
-      'recordatorio_turno_v3': TEMPLATES.recordatorio,
-      'recordatorio_turno_v4': TEMPLATES.recordatorio,
-      'calificar_barbero_v2':  TEMPLATES.calificacion,
-      'agradecimiento_v1':     TEMPLATES.agradecimiento
+      'solicitud_reserva_v3':    'solicitud_reserva_capelli_v1',
+      'solicitud_reserva_v3_':   'solicitud_reserva_capelli_v1',
+      'reserva_confirmada_v2':   'reserva_confirmada_capelli_v1',
+      'reserva_cancelada_v3':    'reserva_cancelada_capelli_v1',
+      'recordatorio_turno_v3':   'recordatorio_turno_capelli_v1',
+      'recordatorio_turno_v4':   'recordatorio_turno_capelli_v1',
+      'calificar_barbero_v2':    'calificar_barbero_capelli_v1',
+      'calificar_barbero':       'calificar_barbero_capelli_v1',
+      'agradecimiento_v1':       'agradecimiento_capelli_v1'
     };
 
-   // En /api/enviar-mensaje de server_capelli.js, reemplaza solo el log:
-const resolvedTemplate = TEMPLATE_MAP[templateName.trim()] || templateName.trim();
-console.log(`[Capelli] Recibido: "${templateName}" → Resuelto: "${resolvedTemplate}"`);
+    const resolvedTemplate = TEMPLATE_MAP[templateName] || templateName;
+    console.log(`[Capelli] Traducción: '${templateName}' → '${resolvedTemplate}'`);
 
-    const ok = await enviarTemplate(normalizarNumeroPY(phone), resolvedTemplate, params);
-    return res.status(ok ? 200 : 500).json({ success: ok });
+    const cleanPhone = normalizarNumeroPY(phone);
+    const ok = await enviarTemplate(cleanPhone, resolvedTemplate, params);
+
+    return res.status(ok ? 200 : 500).json({ success: ok, templateUsed: resolvedTemplate });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
     return res.status(500).json({ success: false, error: error.message });
