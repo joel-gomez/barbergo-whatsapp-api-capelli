@@ -81,6 +81,56 @@ function formatearReserva(reserva) {
 }
 
 
+// ========================================
+// ENVÍO DE PLANTILLAS (META GRAPH API)
+// ========================================
+async function enviarTemplate(numero, templateName, params = []) {
+  try {
+    const components = params.length > 0
+      ? [{
+          type: 'body',
+          parameters: params.map(p => ({ type: 'text', text: String(p) }))
+        }]
+      : [];
+
+    const body = {
+      messaging_product: 'whatsapp',
+      to: numero,
+      type: 'template',
+      template: {
+        name: templateName,
+        language: { code: 'es' },
+        components
+      }
+    };
+
+    console.log(`📤 [Capelli] Enviando '${templateName}' a ${numero}...`);
+
+    const resp = await fetch(`https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      console.error(`❌ [Capelli] Error de Meta [${templateName}]:`, JSON.stringify(data));
+      return false;
+    }
+
+    console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero} via ${PHONE_NUMBER_ID}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ [Capelli] Error enviando template '${templateName}':`, error);
+    return false;
+  }
+}
+
+
 
 // ========================================
 // MENSAJES DE NEGOCIO
