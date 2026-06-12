@@ -156,19 +156,18 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const { phone, templateName, params = [] } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'Faltan datos' });
 
-    // Mapeo de plantillas genéricas a plantillas de Capelli
     const TEMPLATE_MAP = {
-      'solicitud_reserva_v3':    TEMPLATES.solicitud,
-      'solicitud_reserva_v3_':   TEMPLATES.solicitud,
-      'reserva_confirmada_v2':   TEMPLATES.confirmada,
-      'reserva_cancelada_v3':    TEMPLATES.cancelada,
-      'recordatorio_turno_v3':   TEMPLATES.recordatorio,
-      'recordatorio_turno_v4':   TEMPLATES.recordatorio,
-      'calificar_barbero_v2':    TEMPLATES.calificacion,
-      'agradecimiento_v1':       TEMPLATES.agradecimiento
+      'solicitud_reserva_v3':  TEMPLATES.solicitud,
+      'reserva_confirmada_v2': TEMPLATES.confirmada,
+      'reserva_cancelada_v3':  TEMPLATES.cancelada,
+      'recordatorio_turno_v3': TEMPLATES.recordatorio,
+      'recordatorio_turno_v4': TEMPLATES.recordatorio,
+      'calificar_barbero_v2':  TEMPLATES.calificacion,
+      'agradecimiento_v1':     TEMPLATES.agradecimiento
     };
 
-    const resolvedTemplate = TEMPLATE_MAP[templateName] || templateName;
+    // .trim() absorbe cualquier espacio o _ accidental
+    const resolvedTemplate = TEMPLATE_MAP[templateName.trim()] || templateName.trim();
     console.log(`[Capelli] ${templateName} → ${resolvedTemplate}`);
 
     const ok = await enviarTemplate(normalizarNumeroPY(phone), resolvedTemplate, params);
