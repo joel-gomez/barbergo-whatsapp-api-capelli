@@ -181,6 +181,7 @@ console.log(`[Capelli] Recibido: "${templateName}" → Resuelto: "${resolvedTemp
 // REEMPLAZAR la ruta completa /api/reserva-completada:
 
 app.post('/api/reserva-completada', async (req, res) => {
+  console.log(`🔔 [Capelli] /api/reserva-completada recibido | body:`, JSON.stringify(req.body));
   try {
     // Acepta tanto { bookingId } directo como { reserva, bookingId } delegado desde BarberGo
     let { reserva, bookingId } = req.body;
