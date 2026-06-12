@@ -166,9 +166,9 @@ app.post('/api/enviar-mensaje', async (req, res) => {
       'agradecimiento_v1':     TEMPLATES.agradecimiento
     };
 
-    // .trim() absorbe cualquier espacio o _ accidental
-    const resolvedTemplate = TEMPLATE_MAP[templateName.trim()] || templateName.trim();
-    console.log(`[Capelli] ${templateName} → ${resolvedTemplate}`);
+   // En /api/enviar-mensaje de server_capelli.js, reemplaza solo el log:
+const resolvedTemplate = TEMPLATE_MAP[templateName.trim()] || templateName.trim();
+console.log(`[Capelli] Recibido: "${templateName}" → Resuelto: "${resolvedTemplate}"`);
 
     const ok = await enviarTemplate(normalizarNumeroPY(phone), resolvedTemplate, params);
     return res.status(ok ? 200 : 500).json({ success: ok });
@@ -178,29 +178,51 @@ app.post('/api/enviar-mensaje', async (req, res) => {
   }
 });
 
+// REEMPLAZAR la ruta completa /api/reserva-completada:
+
 app.post('/api/reserva-completada', async (req, res) => {
   try {
-    const { reserva, bookingId } = req.body;
-    if (!reserva || !bookingId) return res.status(400).json({ success: false, error: 'Faltan datos' });
-    if (!reserva.isPrimary || reserva.ratingTemplateSent) return res.status(200).json({ success: true });
+    // Acepta tanto { bookingId } directo como { reserva, bookingId } delegado desde BarberGo
+    let { reserva, bookingId } = req.body;
 
+    // Si no viene reserva en el body, la buscamos por bookingId en Firestore
+    if (!reserva && bookingId) {
+      const snap = await db.collection('bookings').doc(bookingId).get();
+      if (!snap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
+      reserva = snap.data();
+    }
+
+    if (!reserva || !bookingId) {
+      return res.status(400).json({ success: false, error: 'Faltan datos' });
+    }
+
+    // Validaciones de negocio
+    if (!reserva.isPrimary)          return res.status(200).json({ success: true, message: 'No es reserva primaria' });
+    if (reserva.ratingTemplateSent)  return res.status(200).json({ success: true, message: 'Rating ya enviado' });
+
+    // Verificar plan premium
     const bookingRef = db.collection('bookings').doc(bookingId);
     let premium = false;
     try {
       const snap = await db.collection('companies').doc(COMPANY_ID).get();
       if (snap.exists) premium = snap.data().plan?.toLowerCase() === 'premium';
-    } catch (e) {}
+    } catch (e) {
+      console.error('[Capelli] Error verificando plan:', e);
+    }
 
     if (!premium) {
       await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'No es Premium' });
     }
 
+    console.log(`💈 [Capelli] Enviando solicitud de calificación para booking ${bookingId}`);
     await enviarCalificacionWhatsApp(reserva);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
-    return res.status(200).json({ success: true });
+
+    return res.status(200).json({ success: true, message: 'Calificación enviada' });
+
   } catch (error) {
-    console.error('❌ Error en /api/reserva-completada:', error);
+    console.error('❌ [Capelli] Error en /api/reserva-completada:', error);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
