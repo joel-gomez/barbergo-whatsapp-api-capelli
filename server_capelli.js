@@ -20,7 +20,7 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
 const PORT            = process.env.PORT || 10000;
 const COMPANY_ID      = 'nI6ilcu8qPbH3xiXXsM7';
-
+const LOCATION_ID = '2OaikKXImqJbfPaqXfG6';
 // ========================================
 // PLANTILLAS DE CAPELLI
 // ========================================
@@ -295,11 +295,11 @@ app.post('/webhook', async (req, res) => {
               const comment = respuestaCliente.trim();
               await db.collection('rating_sessions').doc(telefonoLocal).delete();
 
-              const snapshot = await db.collection('bookings')
-                .where('client.phone', '==', telefonoLocal)
-                .where('companyId', '==', COMPANY_ID)
-                .where('status', '==', 'completed')
-                .orderBy('createdAt', 'desc').limit(3).get();
+const snapshot = await db.collection('bookings')
+  .where('client.phone', '==', telefonoLocal)
+  .where('locationId', '==', LOCATION_ID)   // 🆕
+  .where('status', '==', 'completed')
+  .orderBy('createdAt', 'desc').limit(3).get();
 
               const bookingDoc = snapshot.docs.find(d => !d.data().isReviewed);
               if (!bookingDoc) continue;
@@ -344,11 +344,11 @@ app.post('/webhook', async (req, res) => {
           if (!nuevoEstado) continue;
 
           const estadosValidos = nuevoEstado === 'confirmed' ? ['pending'] : ['pending', 'confirmed'];
-          const snap = await db.collection('bookings')
-            .where('client.phone', '==', telefonoLocal)
-            .where('companyId', '==', COMPANY_ID)
-            .where('status', 'in', estadosValidos)
-            .orderBy('createdAt', 'desc').limit(1).get();
+const snap = await db.collection('bookings')
+  .where('client.phone', '==', telefonoLocal)
+  .where('locationId', '==', LOCATION_ID)   // 🆕
+  .where('status', 'in', estadosValidos)
+  .orderBy('createdAt', 'desc').limit(1).get();
 
           if (snap.empty) continue;
 
@@ -383,9 +383,11 @@ cron.schedule('*/15 * * * *', async () => {
     const now      = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
     const todayStr = now.toISOString().split('T')[0];
 
-    const snapshot = await db.collection('bookings')
-      .where('date', '==', todayStr).where('companyId', '==', COMPANY_ID)
-      .where('status', '==', 'confirmed').where('reminderSent', '==', false).get();
+const snapshot = await db.collection('bookings')
+  .where('date', '==', todayStr)
+  .where('locationId', '==', LOCATION_ID)   // 🆕
+  .where('status', '==', 'confirmed')
+  .where('reminderSent', '==', false).get();
 
     for (const doc of snapshot.docs) {
       const reserva = doc.data();
