@@ -80,22 +80,7 @@ function formatearReserva(reserva) {
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
-// ELIMINAR todo este bloque del interceptor viejo:
-if (templateName === 'solicitud_reserva_v3') {
-  templateName = 'solicitud_reserva_v3_';
-}
-if (templateName === 'calificar_barbero_v2') {
-  templateName = 'calificar_barbero'; 
-}
-if (templateName === 'reserva_confirmada_v2') {
-  templateName = 'TU_NOMBRE_DE_PLANTILLA_CONFIRMADA_CAPELLI'; 
-}
-if (templateName === 'reserva_cancelada_v3') {
-  templateName = 'TU_NOMBRE_DE_PLANTILLA_CANCELADA_CAPELLI'; 
-}
-if (templateName === 'recordatorio_turno_v4') {
-  templateName = 'TU_NOMBRE_DE_PLANTILLA_RECORDATORIO_CAPELLI'; 
-}
+
 
 // ========================================
 // MENSAJES DE NEGOCIO
