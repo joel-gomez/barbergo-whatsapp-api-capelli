@@ -29,7 +29,7 @@ const PORT            = process.env.PORT || 10000;
 
 // Identificadores de la base de datos para aislar la data
 const COMPANY_ID   = 'nI6ilcu8qPbH3xiXXsM7';
-const LOCATION_IDS = ['2OaikKXImqJbfPaqXfG6']; // 👈 si Capelli abre otra sucursal, agregar acá
+const LOCATION_IDS = ['20aikKXImqJbfPaqXfG6'];
 
 // Servidor de BarberGo (para reenviar lo que NO es de Capelli)
 const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo-whatsapp-api.onrender.com';
