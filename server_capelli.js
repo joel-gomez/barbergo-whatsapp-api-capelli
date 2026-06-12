@@ -20,7 +20,6 @@ app.use(express.json());
 // ========================================
 // VARIABLES DE ENTORNO (Exclusivas Capelli)
 // ========================================
-// Estas deben venir de tu archivo barbergo-whatsapp-api-1.env
 const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN; 
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // Debe ser 1117444051458463
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;    // capelli_token_seguro
@@ -57,9 +56,23 @@ function numeroMetaALocal(numeroMeta) {
   return String(numeroMeta || '');
 }
 
+async function esPremium(reserva) {
+  try {
+    const companyId = reserva.companyId || COMPANY_ID;
+    const companySnap = await db.collection('companies').doc(companyId).get();
+    if (companySnap.exists) {
+      const plan = companySnap.data().plan || '';
+      return plan.toLowerCase() === 'premium';
+    }
+  } catch (error) {
+    console.error('❌ Error verificando plan premium:', error);
+  }
+  return false;
+}
+
 async function obtenerDatosUbicacion(locationId) {
   const defaults = { shopName: 'Capelli', mapLink: 'https://maps.app.goo.gl/tu-local', shopUrl: 'https://app.barbergo.com.py' };
-  if (locationId !== LOCATION_ID) return defaults; // Seguridad extra
+  if (locationId !== LOCATION_ID) return defaults; 
   
   try {
     const snap = await db.collection('locations').doc(locationId).get();
@@ -121,9 +134,8 @@ async function enviarTemplate(numero, templateName, params = []) {
       body: JSON.stringify(body)
     });
 
-    const data = await resp.json();
-
     if (!resp.ok) {
+      const data = await resp.json();
       console.error(`❌ [Capelli] Error de Meta [${templateName}]:`, JSON.stringify(data));
       return false;
     }
@@ -182,7 +194,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
       return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
     }
 
-    // Traductor local: si la App manda el nombre genérico, Capelli lo convierte al suyo.
     const TEMPLATE_MAP = {
       'solicitud_reserva_v3':    TEMPLATES.solicitud,
       'reserva_confirmada_v2':   TEMPLATES.confirmada,
@@ -209,39 +220,35 @@ app.post('/api/reserva-completada', async (req, res) => {
     const { bookingId } = req.body;
     if (!bookingId) return res.status(400).json({ success: false, error: 'Falta bookingId' });
 
-    const snap = await db.collection('bookings').doc(bookingId).get();
-    if (!snap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
-    
-    const reserva = snap.data();
+    const bookingRef  = db.collection('bookings').doc(bookingId);
+    const bookingSnap = await bookingRef.get();
 
-    // Validar que sea de Capelli
-    if (reserva.locationId !== LOCATION_ID) {
-      return res.status(200).json({ success: true, message: 'Reserva no pertenece a Capelli. Ignorada.' });
+    if (!bookingSnap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
+
+    const realBooking = bookingSnap.data();
+
+    if (realBooking.locationId !== LOCATION_ID) {
+      return res.status(200).json({ success: true, message: 'No pertenece a Capelli, ignorado.' });
     }
 
-    if (!reserva.isPrimary)         return res.status(200).json({ success: true, message: 'No es reserva primaria' });
-    if (reserva.ratingTemplateSent) return res.status(200).json({ success: true, message: 'Rating ya enviado' });
+    if (!realBooking.isPrimary || realBooking.ratingTemplateSent) {
+      return res.status(200).json({ success: true, message: 'Ya procesado o no es primario' });
+    }
 
-    let premium = false;
-    try {
-      const companySnap = await db.collection('companies').doc(COMPANY_ID).get();
-      if (companySnap.exists) premium = companySnap.data().plan?.toLowerCase() === 'premium';
-    } catch (e) { console.error('[Capelli] Error verificando plan:', e); }
-
+    const premium = await esPremium(realBooking);
     if (!premium) {
-      await snap.ref.update({ ratingTemplateSent: true, isReviewed: false });
-      return res.status(200).json({ success: true, message: 'No es Premium' });
+      await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
+      return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
     }
 
-    console.log(`💈 [Capelli] Enviando solicitud de calificación para booking ${bookingId}`);
-    await enviarCalificacionWhatsApp(reserva);
-    await snap.ref.update({ ratingTemplateSent: true, isReviewed: false });
+    console.log(`💈 Cuenta PREMIUM. Solicitando calificación usando la plantilla: ${TEMPLATES.calificacion}`);
+    await enviarCalificacionWhatsApp(realBooking);
+    await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
-    return res.status(200).json({ success: true, message: 'Calificación enviada' });
-
+    return res.status(200).json({ success: true, message: 'Solicitud de calificación enviada' });
   } catch (error) {
-    console.error('❌ [Capelli] Error en /api/reserva-completada:', error);
-    return res.status(500).json({ success: false, error: error.message });
+    console.error('❌ Error en /api/reserva-completada:', error);
+    return res.status(500).json({ success: false, error: 'Error interno del servidor' });
   }
 });
 
@@ -264,11 +271,7 @@ app.post('/webhook', async (req, res) => {
       for (const change of entry.changes || []) {
         const value = change.value || {};
         
-        // 🛑 FILTRO DE ORO: Solo procesar si el mensaje ingresó a través del número de Capelli
-        if (value.metadata?.phone_number_id !== PHONE_NUMBER_ID) {
-          continue; // Ignorar el evento, le pertenece al otro servidor
-        }
-
+        if (value.metadata?.phone_number_id !== PHONE_NUMBER_ID) continue;
         if (!value.messages) continue;
 
         for (const mensaje of value.messages) {
@@ -285,11 +288,11 @@ app.post('/webhook', async (req, res) => {
 
           console.log(`📞 [Capelli] Mensaje entrante de: ${numeroMeta} | Texto: "${respuestaCliente}"`);
 
-          // 1. Calificación 1-5
+          // 1. Calificación 1-5 (Se guardan en sesiones separadas de la DB)
           const ratingMatch = respuestaCliente.trim().match(/^[1-5]$/);
           if (ratingMatch) {
             const stars = parseInt(ratingMatch[0]);
-            await db.collection('rating_sessions').doc(telefonoLocal).set({
+            await db.collection('rating_sessions_capelli').doc(telefonoLocal).set({
               stars, phone: telefonoLocal, companyId: COMPANY_ID,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               expiresAt: new Date(Date.now() + 10 * 60 * 1000)
@@ -298,14 +301,14 @@ app.post('/webhook', async (req, res) => {
           }
 
           // 2. Comentario de calificación
-          const sessionSnap = await db.collection('rating_sessions').doc(telefonoLocal).get();
+          const sessionSnap = await db.collection('rating_sessions_capelli').doc(telefonoLocal).get();
           if (sessionSnap.exists) {
             const session = sessionSnap.data();
             const expiresAt = session.expiresAt?.toDate ? session.expiresAt.toDate() : new Date(session.expiresAt);
             if (new Date() < expiresAt) {
               const { stars } = session;
               const comment = respuestaCliente.trim();
-              await db.collection('rating_sessions').doc(telefonoLocal).delete();
+              await db.collection('rating_sessions_capelli').doc(telefonoLocal).delete();
 
               const snapshot = await db.collection('bookings')
                 .where('client.phone', '==', telefonoLocal)
@@ -342,7 +345,7 @@ app.post('/webhook', async (req, res) => {
               await enviarAgradecimientoWhatsApp(booking, telefonoLocal);
               continue;
             }
-            await db.collection('rating_sessions').doc(telefonoLocal).delete();
+            await db.collection('rating_sessions_capelli').doc(telefonoLocal).delete();
           }
 
           // 3. Confirmación / Cancelación
@@ -358,7 +361,7 @@ app.post('/webhook', async (req, res) => {
           const estadosValidos = nuevoEstado === 'confirmed' ? ['pending'] : ['pending', 'confirmed'];
           const snap = await db.collection('bookings')
             .where('client.phone', '==', telefonoLocal)
-            .where('locationId', '==', LOCATION_ID) // Blindado a Capelli
+            .where('locationId', '==', LOCATION_ID)
             .where('status', 'in', estadosValidos)
             .orderBy('createdAt', 'desc').limit(1).get();
 
@@ -397,7 +400,7 @@ cron.schedule('*/15 * * * *', async () => {
 
     const snapshot = await db.collection('bookings')
       .where('date', '==', todayStr)
-      .where('locationId', '==', LOCATION_ID) // Blindado a Capelli
+      .where('locationId', '==', LOCATION_ID)
       .where('status', '==', 'confirmed')
       .where('reminderSent', '==', false).get();
 
