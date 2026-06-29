@@ -32,7 +32,7 @@ const COMPANY_ID   = 'nI6ilcu8qPbH3xiXXsM7';
 const LOCATION_IDS = ['20aikKXImqJbfPaqXfG6'];
 
 // Servidor de BarberGo (para reenviar lo que NO es de Capelli)
-const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo-whatsapp-api.onrender.com';
+const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo-whatsapp-api-production.up.railway.app';
 
 // ========================================
 // PLANTILLAS EXCLUSIVAS DE CAPELLI
