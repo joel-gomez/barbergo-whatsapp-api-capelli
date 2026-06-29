@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "server_capelli.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server_capelli.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
