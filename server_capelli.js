@@ -9,7 +9,7 @@ const cors    = require('cors');
 const admin   = require('firebase-admin');
 const cron    = require('node-cron');
 
-const serviceAccount = require('/etc/secrets/firebase-key.json');
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY_JSON);
 if (!admin.apps.length) {
   admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 }
