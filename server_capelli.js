@@ -1,7 +1,5 @@
 // ==========================================================================
 // server_capelli.js — SERVIDOR EXCLUSIVO E INDEPENDIENTE DE CAPELLI
-// Versión con "aduana" bidireccional: verifica pertenencia contra Firestore
-// y reenvía a BarberGo lo que no le corresponde (en vez de ignorarlo).
 // ==========================================================================
 
 const express = require('express');
@@ -19,24 +17,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ========================================
-// VARIABLES DE ENTORNO (Exclusivas Capelli)
-// ========================================
 const WHATSAPP_TOKEN  = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID; // Debe ser 1117444051458463
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;    // capelli_token_seguro
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
 const PORT            = process.env.PORT || 10000;
 
-// Identificadores de la base de datos para aislar la data
 const COMPANY_ID   = 'nI6ilcu8qPbH3xiXXsM7';
 const LOCATION_IDS = ['20aikKXImqJbfPaqXfG6'];
 
-// Servidor de BarberGo (para reenviar lo que NO es de Capelli)
 const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo-whatsapp-api-production.up.railway.app';
 
-// ========================================
-// PLANTILLAS EXCLUSIVAS DE CAPELLI
-// ========================================
 const TEMPLATES = {
   solicitud:      'solicitud_reserva_capelli_v1',
   confirmada:     'reserva_confirmada_capelli_v1',
@@ -46,37 +36,22 @@ const TEMPLATES = {
   agradecimiento: 'agradecimiento_capelli_v1'
 };
 
-// ==========================================================================
-// 🚦 ADUANA: ¿Esta reserva/petición pertenece a Capelli?
-// Verificación en cascada: companyId → locationId conocido → Firestore.
-// Esto cubre reservas viejas que NO tienen companyId guardado.
-// ==========================================================================
 async function perteneceACapelli({ companyId, locationId, booking } = {}) {
   const comp = String(companyId || booking?.companyId || '').trim();
   const loc  = String(locationId || booking?.locationId || '').trim();
-
   if (comp === COMPANY_ID) return true;
   if (loc && LOCATION_IDS.includes(loc)) return true;
-
   if (loc) {
     try {
       const snap = await db.collection('locations').doc(loc).get();
-      if (snap.exists && String(snap.data().companyId || '').trim() === COMPANY_ID) {
-        return true;
-      }
-    } catch (e) {
-      console.error('⚠️ [Capelli Router] Error verificando location:', e.message);
-    }
+      if (snap.exists && String(snap.data().companyId || '').trim() === COMPANY_ID) return true;
+    } catch (e) { console.error('⚠️ [Capelli Router] Error verificando location:', e.message); }
   }
   return false;
 }
 
-/**
- * Reenvía a BarberGo lo que no pertenece a Capelli.
- * Garantiza que ningún mensaje se pierda ni salga del número equivocado.
- */
 async function reenviarABarberGo(path, body, res) {
-  console.log(`↪️  [Relay] Petición que NO es de Capelli. Reenviando a ${BARBERGO_SERVER_URL}${path}`);
+  console.log(`↪️  [Relay] Reenviando a ${BARBERGO_SERVER_URL}${path}`);
   try {
     const r = await fetch(`${BARBERGO_SERVER_URL}${path}`, {
       method: 'POST',
@@ -86,14 +61,11 @@ async function reenviarABarberGo(path, body, res) {
     const data = await r.json().catch(() => ({}));
     return res.status(r.status).json({ ...data, relayedTo: 'barbergo' });
   } catch (e) {
-    console.error('❌ [Relay] No se pudo contactar al servidor de BarberGo:', e.message);
-    return res.status(502).json({ success: false, error: 'No se pudo contactar al servidor de BarberGo', relayedTo: 'barbergo' });
+    console.error('❌ [Relay] No se pudo contactar a BarberGo:', e.message);
+    return res.status(502).json({ success: false, error: 'No se pudo contactar a BarberGo' });
   }
 }
 
-// ========================================
-// HELPERS
-// ========================================
 function normalizarNumeroPY(phone) {
   let n = String(phone || '').replace(/\D/g, '');
   if (n.startsWith('0'))         n = '595' + n.substring(1);
@@ -106,16 +78,16 @@ function numeroMetaALocal(numeroMeta) {
   return String(numeroMeta || '');
 }
 
-async function esPremium(reserva) {
+async function esEmpresarial(reserva) {
   try {
     const companyId = reserva.companyId || COMPANY_ID;
     const companySnap = await db.collection('companies').doc(companyId).get();
     if (companySnap.exists) {
       const plan = companySnap.data().plan || '';
-      return plan.toLowerCase() === 'premium';
+      return plan.toLowerCase() === 'empresarial' || plan.toLowerCase() === 'premium';
     }
   } catch (error) {
-    console.error('❌ Error verificando plan premium:', error);
+    console.error('❌ Error verificando plan:', error);
   }
   return false;
 }
@@ -124,7 +96,6 @@ async function obtenerDatosUbicacion(locationId) {
   const defaults = { shopName: 'Capelli', mapLink: 'https://maps.app.goo.gl/tu-local', shopUrl: 'https://app.barbergo.com.py' };
   const loc = String(locationId || '').trim();
   if (!loc) return defaults;
-
   try {
     const snap = await db.collection('locations').doc(loc).get();
     if (snap.exists) {
@@ -141,9 +112,7 @@ async function obtenerDatosUbicacion(locationId) {
 
 function formatearReserva(reserva) {
   const dateObj = new Date(reserva.date + 'T00:00:00');
-  const formattedDate = dateObj
-    .toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' })
-    .replace(',', '');
+  const formattedDate = dateObj.toLocaleDateString('es-ES', { weekday: 'short', day: 'numeric', month: 'short' }).replace(',', '');
   const clientName   = reserva.client?.name  || 'Cliente';
   const timeStr      = reserva.startTime     || reserva.time || '';
   const barberName   = reserva.barber?.name  || 'Barbero asignado';
@@ -154,58 +123,34 @@ function formatearReserva(reserva) {
   return { clientName, timeStr, barberName, groupId, tId, serviceName, servicePrice, formattedDate };
 }
 
-// ========================================
-// ENVÍO DE PLANTILLAS (META GRAPH API)
-// ========================================
 async function enviarTemplate(numero, templateName, params = []) {
   try {
     const components = params.length > 0
       ? [{ type: 'body', parameters: params.map(p => ({ type: 'text', text: String(p) })) }]
       : [];
-
     const body = {
-      messaging_product: 'whatsapp',
-      to: numero,
-      type: 'template',
-      template: {
-        name: templateName,
-        language: { code: 'es' },
-        components
-      }
+      messaging_product: 'whatsapp', to: numero, type: 'template',
+      template: { name: templateName, language: { code: 'es' }, components }
     };
-
-    console.log(`📤 [Capelli] Enviando '${templateName}' a ${numero} (PHONE_NUMBER_ID: ${PHONE_NUMBER_ID})...`);
-
+    console.log(`📤 [Capelli] Enviando '${templateName}' a ${numero}...`);
     const resp = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
-
     if (!resp.ok) {
       const data = await resp.json();
-      // ⚠️ Mientras las plantillas Capelli estén PENDIENTES en Meta,
-      // acá vas a ver error 132001 (template no existe/no aprobada).
-      // Eso confirma que el SERVIDOR y la PLANTILLA son los correctos:
-      // cuando Meta apruebe las plantillas, empezarán a salir solas.
-      console.error(`❌ [Capelli] Error de Meta [${templateName}]:`, JSON.stringify(data));
+      console.error(`❌ [Capelli] Error Meta [${templateName}]:`, JSON.stringify(data));
       return false;
     }
-
     console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero}`);
     return true;
   } catch (error) {
-    console.error(`❌ [Capelli] Error enviando template '${templateName}':`, error);
+    console.error(`❌ [Capelli] Error enviando '${templateName}':`, error);
     return false;
   }
 }
 
-// ========================================
-// MENSAJES DE NEGOCIO
-// ========================================
 async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
   const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
@@ -231,7 +176,9 @@ async function enviarCalificacionWhatsApp(reserva) {
 async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
   try {
     const snap = await db.collection('companies').doc(COMPANY_ID).get();
-    if (!snap.exists || snap.data().plan?.toLowerCase() !== 'premium') return;
+    if (!snap.exists) return;
+    const plan = snap.data().plan?.toLowerCase() || '';
+    if (plan !== 'empresarial' && plan !== 'premium') return;
   } catch (e) { return; }
   await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, []);
 }
@@ -239,27 +186,17 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
 // ========================================
 // RUTAS
 // ========================================
-app.get('/', (req, res) => res.status(200).json({ ok: true, message: 'Capelli WhatsApp API activa y aislada', role: 'capelli' }));
+app.get('/', (req, res) => res.status(200).json({ ok: true, message: 'Capelli WhatsApp API activa', role: 'capelli' }));
 
-// --------------------------------------------------------------------------
-// /api/enviar-mensaje — CON ADUANA Y TRADUCTOR DE PLANTILLAS
-// --------------------------------------------------------------------------
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
     const { phone, templateName, params = [], locationId, companyId } = req.body;
+    if (!phone || !templateName) return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
 
-    if (!phone || !templateName) {
-      return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
-    }
-
-    // 🚦 ADUANA: si el frontend mandó companyId/locationId y NO es de Capelli,
-    // esta petición no nos corresponde → reenviar a BarberGo.
     if ((companyId || locationId) && !(await perteneceACapelli({ companyId, locationId }))) {
       return reenviarABarberGo('/api/enviar-mensaje', req.body, res);
     }
 
-    // 🔄 TRADUCTOR: si llega un nombre de plantilla de BarberGo,
-    // lo convertimos a su equivalente Capelli automáticamente.
     const TEMPLATE_MAP = {
       'solicitud_reserva_v3':    TEMPLATES.solicitud,
       'reserva_confirmada_v2':   TEMPLATES.confirmada,
@@ -273,7 +210,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
     const resolvedTemplate = TEMPLATE_MAP[templateName] || templateName;
     const cleanPhone = normalizarNumeroPY(phone);
     const ok = await enviarTemplate(cleanPhone, resolvedTemplate, params);
-
     return res.status(ok ? 200 : 500).json({ success: ok, templateUsed: resolvedTemplate, sentBy: 'capelli' });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
@@ -282,7 +218,7 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 });
 
 // --------------------------------------------------------------------------
-// /api/reserva-completada — CON ADUANA (decide con la reserva REAL de Firestore)
+// /api/reserva-completada — CON VERIFICACIÓN DE 24HS INTEGRADA
 // --------------------------------------------------------------------------
 app.post('/api/reserva-completada', async (req, res) => {
   try {
@@ -291,12 +227,10 @@ app.post('/api/reserva-completada', async (req, res) => {
 
     const bookingRef  = db.collection('bookings').doc(bookingId);
     const bookingSnap = await bookingRef.get();
-
     if (!bookingSnap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
 
     const realBooking = bookingSnap.data();
 
-    // 🚦 ADUANA: si NO es de Capelli → reenviar a BarberGo (antes solo se ignoraba)
     if (!(await perteneceACapelli({ booking: realBooking }))) {
       return reenviarABarberGo('/api/reserva-completada', req.body, res);
     }
@@ -305,13 +239,25 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(200).json({ success: true, message: 'Ya procesado o no es primario' });
     }
 
-    const premium = await esPremium(realBooking);
-    if (!premium) {
+    const empresarial = await esEmpresarial(realBooking);
+    if (!empresarial) {
       await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
-      return res.status(200).json({ success: true, message: 'No es cuenta Premium' });
+      return res.status(200).json({ success: true, message: 'Plan sin calificaciones automáticas' });
     }
 
-    console.log(`💈 [Capelli] Cuenta PREMIUM. Solicitando calificación con: ${TEMPLATES.calificacion}`);
+    // ✅ SOLO enviar si la reserva fue HOY o AYER (menos de 24hs)
+    // Si es más vieja, Meta abre nueva ventana de conversación y cobra
+    const fechaReserva = realBooking.date;
+    const hoyAsuncion  = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+    const ayerAsuncion = new Date(Date.now() - 86400000).toLocaleDateString('en-CA', { timeZone: 'America/Asuncion' });
+
+    if (fechaReserva !== hoyAsuncion && fechaReserva !== ayerAsuncion) {
+      console.log(`⏭️ [Capelli] Reserva del ${fechaReserva} fuera de ventana 24hs — calificación omitida`);
+      await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
+      return res.status(200).json({ success: true, message: 'Reserva fuera de ventana de 24hs — calificación omitida' });
+    }
+
+    console.log(`💈 [Capelli] Cuenta EMPRESARIAL. Solicitando calificación con: ${TEMPLATES.calificacion}`);
     await enviarCalificacionWhatsApp(realBooking);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
@@ -322,25 +268,18 @@ app.post('/api/reserva-completada', async (req, res) => {
   }
 });
 
-// --------------------------------------------------------------------------
-// /api/admin-notificar-cancelacion — CON ADUANA (espejo de BarberGo)
-// --------------------------------------------------------------------------
 app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   try {
     const { reserva } = req.body;
+    if (!reserva || !reserva.client || !reserva.client.phone)
+      return res.status(400).json({ success: false, error: 'Faltan datos' });
 
-    if (!reserva || !reserva.client || !reserva.client.phone) {
-      return res.status(400).json({ success: false, error: 'Faltan datos de la reserva o del cliente' });
-    }
-
-    if (!(await perteneceACapelli({ booking: reserva }))) {
+    if (!(await perteneceACapelli({ booking: reserva })))
       return reenviarABarberGo('/api/admin-notificar-cancelacion', req.body, res);
-    }
 
     const numeroMeta = normalizarNumeroPY(reserva.client.phone);
     await enviarRespuestaWhatsApp(reserva, 'cancelled', numeroMeta);
-
-    return res.status(200).json({ success: true, message: 'Mensaje de cancelación enviado', sentBy: 'capelli' });
+    return res.status(200).json({ success: true, message: 'Cancelación enviada', sentBy: 'capelli' });
   } catch (error) {
     console.error('❌ Error en /api/admin-notificar-cancelacion:', error);
     return res.status(500).json({ success: false, error: 'Error interno del servidor' });
@@ -348,7 +287,7 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
 });
 
 // ========================================
-// WEBHOOK META (Aislado por phone_number_id)
+// WEBHOOK META
 // ========================================
 app.get('/webhook', (req, res) => {
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
@@ -365,8 +304,6 @@ app.post('/webhook', async (req, res) => {
     for (const entry of body.entry || []) {
       for (const change of entry.changes || []) {
         const value = change.value || {};
-
-        // 🛑 FILTRO DE ORO: solo mensajes que llegaron al número de Capelli
         if (value.metadata?.phone_number_id !== PHONE_NUMBER_ID) continue;
         if (!value.messages) continue;
 
@@ -382,9 +319,9 @@ app.post('/webhook', async (req, res) => {
               mensaje.interactive?.list_reply?.title?.toLowerCase()?.trim() || '';
           }
 
-          console.log(`📞 [Capelli] Mensaje entrante de: ${numeroMeta} | Texto: "${respuestaCliente}"`);
+          console.log(`📞 [Capelli] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}"`);
 
-          // 1. Calificación 1-5 (sesiones separadas de la DB)
+          // 1. Calificación 1-5
           const ratingMatch = respuestaCliente.trim().match(/^[1-5]$/);
           if (ratingMatch) {
             const stars = parseInt(ratingMatch[0]);
@@ -399,7 +336,7 @@ app.post('/webhook', async (req, res) => {
           // 2. Comentario de calificación
           const sessionSnap = await db.collection('rating_sessions_capelli').doc(telefonoLocal).get();
           if (sessionSnap.exists) {
-            const session = sessionSnap.data();
+            const session   = sessionSnap.data();
             const expiresAt = session.expiresAt?.toDate ? session.expiresAt.toDate() : new Date(session.expiresAt);
             if (new Date() < expiresAt) {
               const { stars } = session;
@@ -425,7 +362,6 @@ app.post('/webhook', async (req, res) => {
               if (directSnap.exists) {
                 barberRef = directSnap.ref;
               } else {
-                // Búsqueda flexible por campo 'id' (igual que BarberGo)
                 for (const idValue of [Number(barberId), barberId]) {
                   const q = await db.collection('locations').doc(locationId).collection('barbers').where('id', '==', idValue).limit(1).get();
                   if (!q.empty) { barberRef = q.docs[0].ref; break; }
@@ -436,7 +372,7 @@ app.post('/webhook', async (req, res) => {
               await db.runTransaction(async (t) => {
                 const barberDoc = await t.get(barberRef);
                 if (!barberDoc.exists) return;
-                const curr = barberDoc.data().rating || 0;
+                const curr  = barberDoc.data().rating || 0;
                 const count = barberDoc.data().reviewsCount || 0;
                 const newCount = count + 1;
                 t.update(barberRef, { rating: parseFloat(((curr * count + stars) / newCount).toFixed(1)), reviewsCount: newCount });
@@ -453,7 +389,7 @@ app.post('/webhook', async (req, res) => {
           }
 
           // 3. Confirmación / Cancelación
-          const palabras = respuestaCliente.split(/[\s,.!?;:()]+/).filter(Boolean);
+          const palabras    = respuestaCliente.split(/[\s,.!?;:()]+/).filter(Boolean);
           const esConfirmar = palabras.some(p => ['si','sí','sii','siii','ok','okey','dale','voy','asisto','perfecto','excelente','seguro'].includes(p)) || respuestaCliente.includes('confirm');
           const esCancelar  = palabras.some(p => ['no','imposible'].includes(p)) || respuestaCliente.includes('cancel') || respuestaCliente.includes('no voy') || respuestaCliente.includes('me complico');
 
@@ -484,7 +420,6 @@ app.post('/webhook', async (req, res) => {
             bloquesSnap.forEach(d => batch.update(d.ref, { status: nuevoEstado, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
             await batch.commit();
           }
-
           await enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta);
         }
       }
@@ -501,7 +436,6 @@ cron.schedule('*/15 * * * *', async () => {
   try {
     const now      = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/Asuncion' }));
     const todayStr = now.toISOString().split('T')[0];
-
     const snapshot = await db.collection('bookings')
       .where('date', '==', todayStr)
       .where('locationId', 'in', LOCATION_IDS)
@@ -516,7 +450,6 @@ cron.schedule('*/15 * * * *', async () => {
       const bookingTime = new Date(now);
       bookingTime.setHours(h, m, 0, 0);
       const diffMinutes = Math.floor((bookingTime - now) / 60000);
-
       if (diffMinutes >= 105 && diffMinutes <= 135) {
         await db.collection('bookings').doc(doc.id).update({ reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
         await enviarRecordatorioWhatsApp(reserva);
@@ -529,12 +462,10 @@ cron.schedule('*/15 * * * *', async () => {
 
 // ========================================
 // NOTIFICACIONES PUSH FCM
-// (mismo proyecto Firebase, no necesita aduana)
 // ========================================
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
   if (!tokens || tokens.length === 0) return res.status(400).json({ error: 'Sin tokens' });
-
   try {
     const response = await admin.messaging().sendEachForMulticast({
       tokens,
@@ -554,7 +485,6 @@ app.post('/api/notificar-reserva', async (req, res) => {
         notification: { tag: data?.bookingId || 'nueva-reserva', renotify: false }
       }
     });
-
     res.json({ success: true, enviados: response.successCount });
   } catch (error) {
     console.error('❌ Error FCM Capelli:', error);
@@ -563,6 +493,6 @@ app.post('/api/notificar-reserva', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Capelli WhatsApp API activa y separada en puerto ${PORT}`);
+  console.log(`🚀 Capelli WhatsApp API activa en puerto ${PORT}`);
   console.log(`🚦 Relay configurado hacia BarberGo: ${BARBERGO_SERVER_URL}`);
 });
