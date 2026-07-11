@@ -82,6 +82,33 @@ function minutosHastaTurno(startTimeStr, pyNow) {
 }
 
 // =====================================================================
+// 📡 ALCANCE COMPARTIDO DEL PORTFOLIO DE META (clientes únicos / 24hs)
+// ---------------------------------------------------------------------
+// Capelli y el bot compartido de BarberGo viven en el MISMO Business
+// Portfolio de Meta → comparten el MISMO límite de alcance (clientes
+// únicos contactados con mensajes que NOSOTROS iniciamos, en una
+// ventana móvil de 24hs). Este helper escribe en la MISMA colección
+// `meta_reach_daily` que usa server.js (mismo proyecto de Firebase),
+// así el conteo sale combinado entre los dos servers sin que ninguno
+// tenga que saber nada del otro. Ver comentario completo en server.js.
+// Solo visibilidad, no bloqueo — es aproximado (día calendario PY, no
+// la ventana móvil exacta de Meta).
+// =====================================================================
+async function registrarAlcanceMeta(phone) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone) return;
+    const hoy = fechaPY();
+    await db.collection('meta_reach_daily').doc(hoy).set({
+      numeros: { [cleanPhone]: admin.firestore.FieldValue.serverTimestamp() },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Capelli] [Alcance Meta] No se pudo registrar:', e.message);
+  }
+}
+
+// =====================================================================
 // 💳 CUPO MENSUAL DE MENSAJES DE CAPELLI
 // ---------------------------------------------------------------------
 // Capelli tiene un límite propio negociado (2000/mes), distinto de los
@@ -234,7 +261,7 @@ function formatearReserva(reserva) {
 // - skipLimitCheck: salta el chequeo previo (el caller ya validó con puedeEnviar)
 // - El cupo se descuenta SOLO si Meta aceptó el mensaje (consumirCupo al final)
 // =====================================================================
-async function enviarTemplate(numero, templateName, params = [], companyId = COMPANY_ID, skipLimitCheck = false) {
+async function enviarTemplate(numero, templateName, params = [], companyId = COMPANY_ID, skipLimitCheck = false, esIniciadoPorNegocio = true) {
   if (!skipLimitCheck) {
     const { permitido, motivo } = await puedeEnviar(companyId);
     if (!permitido) { console.log(`🚫 [Capelli] Bloqueado (${motivo})`); return false; }
@@ -260,6 +287,9 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
     }
     console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero}`);
     await consumirCupo(companyId); // ✅ recién ahora, con el mensaje aceptado, descontamos 1 crédito
+    // 📡 Solo cuenta para el alcance compartido de Meta si lo iniciamos nosotros
+    // (ver comentario de registrarAlcanceMeta más arriba)
+    if (esIniciadoPorNegocio) await registrarAlcanceMeta(numero);
     return true;
   } catch (error) {
     console.error(`❌ [Capelli] Error enviando '${templateName}':`, error);
@@ -267,12 +297,12 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
   }
 }
 
-async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta) {
+async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, esIniciadoPorNegocio = true) {
   const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
   const templateName = nuevoEstado === 'confirmed' ? TEMPLATES.confirmada : TEMPLATES.cancelada;
   const linkFinal    = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
-  await enviarTemplate(numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal]);
+  await enviarTemplate(numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], COMPANY_ID, false, esIniciadoPorNegocio);
 }
 
 async function enviarRecordatorioWhatsApp(reserva) {
@@ -296,7 +326,8 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
     const plan = snap.data().plan?.toLowerCase() || '';
     if (plan !== 'empresarial' && plan !== 'premium') return;
   } catch (e) { return; }
-  await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, []);
+  // Siempre es respuesta a un comentario del cliente → dentro de ventana de servicio, no cuenta para Meta
+  await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false);
 }
 
 // ========================================
@@ -548,7 +579,7 @@ app.post('/webhook', async (req, res) => {
             bloquesSnap.forEach(d => batch.update(d.ref, { status: nuevoEstado, updatedAt: admin.firestore.FieldValue.serverTimestamp() }));
             await batch.commit();
           }
-          await enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta);
+          await enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, false);
         }
       }
     }
@@ -628,4 +659,5 @@ app.listen(PORT, () => {
   console.log(`🚀 Capelli WhatsApp API activa en puerto ${PORT}`);
   console.log(`🚦 Relay configurado hacia BarberGo: ${BARBERGO_SERVER_URL}`);
   console.log(`💳 Cupo mensual WhatsApp: ${WHATSAPP_MENSUAL_LIMIT} msgs/mes`);
+  console.log(`📡 Alcance compartido con el bot de BarberGo vía meta_reach_daily (mismo Business Portfolio)`);
 });
