@@ -129,12 +129,20 @@ async function registrarAlcanceMeta(phone) {
 // =====================================================================
 const WHATSAPP_MENSUAL_LIMIT = parseInt(process.env.WHATSAPP_MENSUAL_LIMIT || '2000', 10);
 
+// =====================================================================
+// 🔓 BLOQUEO_ACTIVO — interruptor único para reactivar el corte de envíos
+// al llegar al límite. Hoy en `false` a pedido: seguimos contando el uso
+// real (para el panel de estadísticas), pero NUNCA se corta el envío por
+// haber llegado al límite mensual. Para volver a bloquear, poner en `true`.
+// =====================================================================
+const BLOQUEO_ACTIVO = false;
+
 async function puedeEnviar(companyId = COMPANY_ID) {
   const mesActual = fechaPY().slice(0, 7);
   try {
     const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
-    if (actual >= WHATSAPP_MENSUAL_LIMIT) return { permitido: false, motivo: 'limite_mensual_capelli' };
+    if (actual >= WHATSAPP_MENSUAL_LIMIT) return { permitido: !BLOQUEO_ACTIVO, motivo: 'limite_mensual_capelli' };
     return { permitido: true, motivo: 'capelli_ok', count: actual, limit: WHATSAPP_MENSUAL_LIMIT };
   } catch (e) {
     console.error('❌ [Capelli] Error en puedeEnviar:', e.message);
@@ -149,7 +157,6 @@ async function consumirCupo(companyId = COMPANY_ID) {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
-      if (actual >= WHATSAPP_MENSUAL_LIMIT) return { consumido: false, count: actual };
       t.set(ref, {
         companyId,
         plan: 'empresarial', // Capelli opera a nivel empresarial, con límite propio más alto
@@ -160,8 +167,7 @@ async function consumirCupo(companyId = COMPANY_ID) {
       }, { merge: true });
       return { consumido: true, count: actual + 1 };
     });
-    if (r.consumido) console.log(`📊 [Capelli] usa ${r.count}/${WHATSAPP_MENSUAL_LIMIT} msgs este mes.`);
-    else console.log(`🚫 [Capelli] Sin cupo al consumir (${r.count}/${WHATSAPP_MENSUAL_LIMIT}).`);
+    console.log(`📊 [Capelli] usa ${r.count}/${WHATSAPP_MENSUAL_LIMIT} msgs este mes.`);
     return r;
   } catch (e) {
     console.error('❌ [Capelli] Error en consumirCupo:', e.message);
