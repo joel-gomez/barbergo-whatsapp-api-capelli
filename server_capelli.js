@@ -38,15 +38,6 @@ const TEMPLATES = {
 
 // =====================================================================
 // 🕐 HORA DE PARAGUAY — UTC-3 FIJO
-// ---------------------------------------------------------------------
-// ⚠️ Mismo bug que se encontró y arregló en barbergo-whatsapp-api
-// (server.js principal): el tzdata del contenedor de Railway está
-// desactualizado y todavía aplica la regla VIEJA de horario de verano/
-// invierno de Paraguay — pero esa regla se eliminó por ley (Ley 7354)
-// en octubre de 2024. Paraguay es UTC-3 fijo, todo el año, sin cambios.
-// Usar Intl/toLocaleString con 'America/Asuncion' da la hora ~1h
-// atrasada en invierno. Por eso acá SIEMPRE se calcula con offset fijo
-// en vez de depender de la zona horaria del sistema.
 // =====================================================================
 const PY_OFFSET_MIN = -180; // UTC-3
 
@@ -74,26 +65,12 @@ function horaParaguay() {
   };
 }
 
-// Positivo = falta para el turno | Negativo = el turno ya pasó
 function minutosHastaTurno(startTimeStr, pyNow) {
   if (!startTimeStr) return null;
   const [h, m] = startTimeStr.split(':').map(Number);
   return (h * 60 + m) - pyNow.minutosDelDia;
 }
 
-// =====================================================================
-// 📡 ALCANCE COMPARTIDO DEL PORTFOLIO DE META (clientes únicos / 24hs)
-// ---------------------------------------------------------------------
-// Capelli y el bot compartido de BarberGo viven en el MISMO Business
-// Portfolio de Meta → comparten el MISMO límite de alcance (clientes
-// únicos contactados con mensajes que NOSOTROS iniciamos, en una
-// ventana móvil de 24hs). Este helper escribe en la MISMA colección
-// `meta_reach_daily` que usa server.js (mismo proyecto de Firebase),
-// así el conteo sale combinado entre los dos servers sin que ninguno
-// tenga que saber nada del otro. Ver comentario completo en server.js.
-// Solo visibilidad, no bloqueo — es aproximado (día calendario PY, no
-// la ventana móvil exacta de Meta).
-// =====================================================================
 async function registrarAlcanceMeta(phone) {
   try {
     const cleanPhone = String(phone || '').replace(/\D/g, '');
@@ -109,38 +86,56 @@ async function registrarAlcanceMeta(phone) {
 }
 
 // =====================================================================
-// 💳 CUPO MENSUAL DE MENSAJES DE CAPELLI
-// ---------------------------------------------------------------------
-// Capelli tiene un límite propio negociado (2000/mes), distinto de los
-// planes estándar basic/premium/empresarial del server.js compartido.
-// Se guarda en la MISMA colección `usage_monthly` que usa el server
-// principal (mismo formato de doc: monthly_{companyId}_{YYYY-MM}) —
-// así el panel "Uso WhatsApp" del SuperAdmin lo muestra automáticamente,
-// sin ningún cambio adicional ahí.
-//
-// Mismo patrón de seguridad que en server.js:
-// - puedeEnviar()  → SOLO LECTURA, nunca incrementa el contador.
-// - consumirCupo() → transacción que incrementa, se llama SOLO después
-//   de que Meta aceptó el mensaje (nunca se descuenta cupo por un envío
-//   que falló, se omitió o fue bloqueado).
-//
-// El límite se puede ajustar desde Railway con la variable de entorno
-// WHATSAPP_MENSUAL_LIMIT, sin tocar código ni redeployar.
+// 📅 CICLO DE FACTURACIÓN DE CAPELLI — mismo mecanismo que server.js
+// compartido: en vez de reiniciar el cupo el día 1 de cada mes
+// calendario, se ancla a companies/{COMPANY_ID}.paidUntil (la fecha de
+// vencimiento que se actualiza a mano en el SuperAdmin cada vez que
+// Capelli paga). Mientras paidUntil no cambie, sigue siendo el mismo
+// ciclo; el día que se actualiza, arranca uno nuevo solo.
+// Se cachea 60s para no pegarle a Firestore en cada mensaje.
 // =====================================================================
-const WHATSAPP_MENSUAL_LIMIT = parseInt(process.env.WHATSAPP_MENSUAL_LIMIT || '2000', 10);
+let PAID_UNTIL_CACHE = { value: undefined, cachedAt: 0 };
+const PAID_UNTIL_TTL_MS = 60 * 1000;
+
+async function obtenerPaidUntil() {
+  const ahora = Date.now();
+  if (PAID_UNTIL_CACHE.value !== undefined && (ahora - PAID_UNTIL_CACHE.cachedAt) < PAID_UNTIL_TTL_MS) {
+    return PAID_UNTIL_CACHE.value;
+  }
+  try {
+    const snap = await db.collection('companies').doc(COMPANY_ID).get();
+    const paidUntil = snap.exists ? (snap.data().paidUntil || null) : null;
+    PAID_UNTIL_CACHE = { value: paidUntil, cachedAt: ahora };
+    return paidUntil;
+  } catch (e) {
+    console.error('⚠️ [Capelli] Error obteniendo paidUntil:', e.message);
+    return null;
+  }
+}
+
+function obtenerCicloId(paidUntil) {
+  if (paidUntil) {
+    try {
+      const fecha = paidUntil.toDate ? paidUntil.toDate() : new Date(paidUntil);
+      if (!isNaN(fecha.getTime())) {
+        return `venc-${fecha.toISOString().slice(0, 10)}`;
+      }
+    } catch (e) { /* cae al respaldo de abajo */ }
+  }
+  return fechaPY().slice(0, 7);
+}
 
 // =====================================================================
-// 🔓 BLOQUEO_ACTIVO — interruptor único para reactivar el corte de envíos
-// al llegar al límite. Hoy en `false` a pedido: seguimos contando el uso
-// real (para el panel de estadísticas), pero NUNCA se corta el envío por
-// haber llegado al límite mensual. Para volver a bloquear, poner en `true`.
+// 💳 CUPO MENSUAL DE MENSAJES DE CAPELLI
 // =====================================================================
+const WHATSAPP_MENSUAL_LIMIT = parseInt(process.env.WHATSAPP_MENSUAL_LIMIT || '2000', 10);
 const BLOQUEO_ACTIVO = false;
 
 async function puedeEnviar(companyId = COMPANY_ID) {
-  const mesActual = fechaPY().slice(0, 7);
+  const paidUntil = await obtenerPaidUntil();
+  const cicloId = obtenerCicloId(paidUntil);
   try {
-    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`).get();
+    const snap = await db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`).get();
     const actual = snap.exists ? (snap.data().count || 0) : 0;
     if (actual >= WHATSAPP_MENSUAL_LIMIT) return { permitido: !BLOQUEO_ACTIVO, motivo: 'limite_mensual_capelli' };
     return { permitido: true, motivo: 'capelli_ok', count: actual, limit: WHATSAPP_MENSUAL_LIMIT };
@@ -150,24 +145,30 @@ async function puedeEnviar(companyId = COMPANY_ID) {
   }
 }
 
-async function consumirCupo(companyId = COMPANY_ID) {
-  const mesActual = fechaPY().slice(0, 7);
-  const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${mesActual}`);
+// categoria: para qué se usó el mensaje — mismo desglose que server.js
+async function consumirCupo(companyId = COMPANY_ID, categoria = 'otro') {
+  const paidUntil = await obtenerPaidUntil();
+  const cicloId = obtenerCicloId(paidUntil);
+  const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`);
   try {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
+      const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
+      const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
       t.set(ref, {
         companyId,
-        plan: 'empresarial', // Capelli opera a nivel empresarial, con límite propio más alto
-        mes: mesActual,
+        plan: 'empresarial',
+        mes: fechaPY().slice(0, 7),
+        cicloId,
         count: actual + 1,
         limit: WHATSAPP_MENSUAL_LIMIT,
+        desglose: nuevoDesglose,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
       return { consumido: true, count: actual + 1 };
     });
-    console.log(`📊 [Capelli] usa ${r.count}/${WHATSAPP_MENSUAL_LIMIT} msgs este mes.`);
+    console.log(`📊 [Capelli] usa ${r.count}/${WHATSAPP_MENSUAL_LIMIT} msgs en su ciclo actual (${cicloId}). (${categoria})`);
     return r;
   } catch (e) {
     console.error('❌ [Capelli] Error en consumirCupo:', e.message);
@@ -263,11 +264,9 @@ function formatearReserva(reserva) {
 }
 
 // =====================================================================
-// 📤 ENVIAR TEMPLATE
-// - skipLimitCheck: salta el chequeo previo (el caller ya validó con puedeEnviar)
-// - El cupo se descuenta SOLO si Meta aceptó el mensaje (consumirCupo al final)
+// 📤 ENVIAR TEMPLATE (con categoria para el desglose)
 // =====================================================================
-async function enviarTemplate(numero, templateName, params = [], companyId = COMPANY_ID, skipLimitCheck = false, esIniciadoPorNegocio = true) {
+async function enviarTemplate(numero, templateName, params = [], companyId = COMPANY_ID, skipLimitCheck = false, esIniciadoPorNegocio = true, categoria = 'otro') {
   if (!skipLimitCheck) {
     const { permitido, motivo } = await puedeEnviar(companyId);
     if (!permitido) { console.log(`🚫 [Capelli] Bloqueado (${motivo})`); return false; }
@@ -289,12 +288,10 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
     if (!resp.ok) {
       const data = await resp.json().catch(() => ({}));
       console.error(`❌ [Capelli] Error Meta [${templateName}]:`, JSON.stringify(data));
-      return false; // ❌ Meta rechazó → NO se consume cupo
+      return false;
     }
     console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero}`);
-    await consumirCupo(companyId); // ✅ recién ahora, con el mensaje aceptado, descontamos 1 crédito
-    // 📡 Solo cuenta para el alcance compartido de Meta si lo iniciamos nosotros
-    // (ver comentario de registrarAlcanceMeta más arriba)
+    await consumirCupo(companyId, categoria);
     if (esIniciadoPorNegocio) await registrarAlcanceMeta(numero);
     return true;
   } catch (error) {
@@ -308,21 +305,24 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, esInici
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
   const templateName = nuevoEstado === 'confirmed' ? TEMPLATES.confirmada : TEMPLATES.cancelada;
   const linkFinal    = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
-  await enviarTemplate(numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], COMPANY_ID, false, esIniciadoPorNegocio);
+  const categoria = !esIniciadoPorNegocio
+    ? 'respuestaCliente'
+    : (nuevoEstado === 'confirmed' ? 'confirmadaDirecta' : 'cancelada');
+  await enviarTemplate(numeroMeta, templateName, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, linkFinal], COMPANY_ID, false, esIniciadoPorNegocio, categoria);
 }
 
 async function enviarRecordatorioWhatsApp(reserva) {
   const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
   const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
-  await enviarTemplate(cleanPhone, TEMPLATES.recordatorio, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink]);
+  await enviarTemplate(cleanPhone, TEMPLATES.recordatorio, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink], COMPANY_ID, false, true, 'recordatorio');
 }
 
 async function enviarCalificacionWhatsApp(reserva) {
   const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
   if (!cleanPhone) return;
   const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
-  await enviarTemplate(cleanPhone, TEMPLATES.calificacion, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero']);
+  await enviarTemplate(cleanPhone, TEMPLATES.calificacion, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero'], COMPANY_ID, false, true, 'calificacion');
 }
 
 async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
@@ -332,8 +332,7 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
     const plan = snap.data().plan?.toLowerCase() || '';
     if (plan !== 'empresarial' && plan !== 'premium') return;
   } catch (e) { return; }
-  // Siempre es respuesta a un comentario del cliente → dentro de ventana de servicio, no cuenta para Meta
-  await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false);
+  await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false, 'agradecimiento');
 }
 
 // ========================================
@@ -343,7 +342,7 @@ app.get('/', (req, res) => res.status(200).json({ ok: true, message: 'Capelli Wh
 
 app.post('/api/enviar-mensaje', async (req, res) => {
   try {
-    const { phone, templateName, params = [], locationId, companyId } = req.body;
+    const { phone, templateName, params = [], locationId, companyId, esReenvioManual } = req.body;
     if (!phone || !templateName) return res.status(400).json({ success: false, error: 'phone y templateName son obligatorios' });
 
     if ((companyId || locationId) && !(await perteneceACapelli({ companyId, locationId }))) {
@@ -352,7 +351,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
     const cid = companyId || COMPANY_ID;
 
-    // Chequeo de cupo SOLO LECTURA antes de intentar mandar
     const { permitido, motivo } = await puedeEnviar(cid);
     if (!permitido) {
       console.log(`🚫 [Capelli] Bloqueado (${motivo})`);
@@ -371,8 +369,14 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
     const resolvedTemplate = TEMPLATE_MAP[templateName] || templateName;
     const cleanPhone = normalizarNumeroPY(phone);
-    // skipLimitCheck=true: ya validamos arriba, enviarTemplate solo descuenta si Meta acepta
-    const ok = await enviarTemplate(cleanPhone, resolvedTemplate, params, cid, true);
+
+    let categoria = 'otro';
+    if (esReenvioManual) categoria = 'reenvioManual';
+    else if (resolvedTemplate === TEMPLATES.solicitud) categoria = 'solicitud';
+    else if (resolvedTemplate === TEMPLATES.confirmada) categoria = 'confirmadaDirecta';
+    else if (resolvedTemplate === TEMPLATES.cancelada) categoria = 'cancelada';
+
+    const ok = await enviarTemplate(cleanPhone, resolvedTemplate, params, cid, true, true, categoria);
     return res.status(ok ? 200 : 500).json({ success: ok, templateUsed: resolvedTemplate, sentBy: 'capelli' });
   } catch (error) {
     console.error('❌ Error en /api/enviar-mensaje:', error);
@@ -380,9 +384,6 @@ app.post('/api/enviar-mensaje', async (req, res) => {
   }
 });
 
-// --------------------------------------------------------------------------
-// /api/reserva-completada — CON VERIFICACIÓN DE 24HS INTEGRADA
-// --------------------------------------------------------------------------
 app.post('/api/reserva-completada', async (req, res) => {
   try {
     const { bookingId } = req.body;
@@ -408,10 +409,6 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(200).json({ success: true, message: 'Plan sin calificaciones automáticas' });
     }
 
-    // ✅ SOLO enviar si la reserva fue HOY o AYER (menos de 24hs)
-    // Si es más vieja, Meta abre nueva ventana de conversación y cobra
-    // (fechaPY con offset fijo UTC-3 — ver comentario arriba, antes usaba
-    // toLocaleDateString('America/Asuncion') que daba la hora atrasada)
     const fechaReserva = realBooking.date;
     const hoyAsuncion  = fechaPY();
     const ayerAsuncion = fechaPY(-1);
@@ -451,9 +448,6 @@ app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   }
 });
 
-// ========================================
-// WEBHOOK META
-// ========================================
 app.get('/webhook', (req, res) => {
   const { 'hub.mode': mode, 'hub.verify_token': token, 'hub.challenge': challenge } = req.query;
   if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
@@ -486,7 +480,6 @@ app.post('/webhook', async (req, res) => {
 
           console.log(`📞 [Capelli] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}"`);
 
-          // 1. Calificación 1-5
           const ratingMatch = respuestaCliente.trim().match(/^[1-5]$/);
           if (ratingMatch) {
             const stars = parseInt(ratingMatch[0]);
@@ -498,7 +491,6 @@ app.post('/webhook', async (req, res) => {
             continue;
           }
 
-          // 2. Comentario de calificación
           const sessionSnap = await db.collection('rating_sessions_capelli').doc(telefonoLocal).get();
           if (sessionSnap.exists) {
             const session   = sessionSnap.data();
@@ -553,7 +545,6 @@ app.post('/webhook', async (req, res) => {
             await db.collection('rating_sessions_capelli').doc(telefonoLocal).delete();
           }
 
-          // 3. Confirmación / Cancelación
           const palabras    = respuestaCliente.split(/[\s,.!?;:()]+/).filter(Boolean);
           const esConfirmar = palabras.some(p => ['si','sí','sii','siii','ok','okey','dale','voy','asisto','perfecto','excelente','seguro'].includes(p)) || respuestaCliente.includes('confirm');
           const esCancelar  = palabras.some(p => ['no','imposible'].includes(p)) || respuestaCliente.includes('cancel') || respuestaCliente.includes('no voy') || respuestaCliente.includes('me complico');
@@ -594,9 +585,6 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// ========================================
-// CRON: RECORDATORIOS 2HS ANTES
-// ========================================
 cron.schedule('*/15 * * * *', async () => {
   try {
     const py = horaParaguay();
@@ -609,7 +597,6 @@ cron.schedule('*/15 * * * *', async () => {
       .where('reminderSent', '==', false).get();
 
     for (const doc of snapshot.docs) {
-      // try/catch por reserva: una falla no debe abortar el resto de la corrida
       try {
         const reserva = doc.data();
         const timeStr = reserva.startTime || reserva.time;
@@ -629,9 +616,6 @@ cron.schedule('*/15 * * * *', async () => {
   }
 });
 
-// ========================================
-// NOTIFICACIONES PUSH FCM
-// ========================================
 app.post('/api/notificar-reserva', async (req, res) => {
   const { tokens, title, body, data } = req.body;
   if (!tokens || tokens.length === 0) return res.status(400).json({ error: 'Sin tokens' });
