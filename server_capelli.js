@@ -86,6 +86,42 @@ async function registrarAlcanceMeta(phone) {
 }
 
 // =====================================================================
+// 🕐 VENTANA DE SERVICIO REAL (24hs) — mismo mecanismo que server.js:
+// un mensaje es gratis si ese cliente le escribió a Capelli en las
+// últimas 24hs, sin importar el tipo de mensaje. Confirmado contra las
+// estadísticas reales de Meta Business Manager.
+// =====================================================================
+async function registrarMensajeEntrante(phone, companyId = COMPANY_ID) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone) return;
+    await db.collection('client_windows').doc(`${companyId}_${cleanPhone}`).set({
+      companyId, phone: cleanPhone,
+      lastMessageAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Capelli] [Ventana 24hs] No se pudo registrar:', e.message);
+  }
+}
+
+async function ventanaAbierta(phone, companyId = COMPANY_ID) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone) return false;
+    const snap = await db.collection('client_windows').doc(`${companyId}_${cleanPhone}`).get();
+    if (!snap.exists) return false;
+    const lastMessageAt = snap.data().lastMessageAt;
+    if (!lastMessageAt) return false;
+    const fecha = lastMessageAt.toDate ? lastMessageAt.toDate() : new Date(lastMessageAt);
+    const horasDesde = (Date.now() - fecha.getTime()) / (1000 * 60 * 60);
+    return horasDesde < 24;
+  } catch (e) {
+    console.error('⚠️ [Capelli] [Ventana 24hs] Error consultando:', e.message);
+    return false;
+  }
+}
+
+// =====================================================================
 // 📅 CICLO DE FACTURACIÓN DE CAPELLI — mismo mecanismo que server.js
 // compartido: en vez de reiniciar el cupo el día 1 de cada mes
 // calendario, se ancla a companies/{COMPANY_ID}.paidUntil (la fecha de
@@ -146,17 +182,12 @@ async function puedeEnviar(companyId = COMPANY_ID) {
 }
 
 // categoria: para qué se usó el mensaje — mismo desglose que server.js
-// 🆓 Categorías que caen dentro de una ventana de servicio ya abierta
-// por el cliente — no generan cobro nuevo de Meta en la práctica. Se
-// registran en el desglose, pero NO suman al "count" que compite
-// contra el límite mensual.
-const CATEGORIAS_GRATIS = ['respuestaCliente', 'agradecimiento'];
-
-async function consumirCupo(companyId = COMPANY_ID, categoria = 'otro') {
+// 🆓 "esGratis" lo decide ventanaAbierta() — reemplaza la lista fija de
+// categorías, que subestimaba cuánto es gratis en la práctica.
+async function consumirCupo(companyId = COMPANY_ID, categoria = 'otro', esGratis = false) {
   const paidUntil = await obtenerPaidUntil();
   const cicloId = obtenerCicloId(paidUntil);
   const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`);
-  const esGratis = CATEGORIAS_GRATIS.includes(categoria);
   try {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
@@ -299,7 +330,8 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
       return false;
     }
     console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero}`);
-    await consumirCupo(companyId, categoria);
+    const esGratis = await ventanaAbierta(numero, companyId);
+    await consumirCupo(companyId, categoria, esGratis);
     if (esIniciadoPorNegocio) await registrarAlcanceMeta(numero);
     return true;
   } catch (error) {
@@ -478,6 +510,10 @@ app.post('/webhook', async (req, res) => {
           const numeroMeta    = mensaje.from || '';
           const telefonoLocal = numeroMetaALocal(numeroMeta);
           let respuestaCliente = '';
+
+          // 🕐 Se registra ante CUALQUIER mensaje del cliente — abre/
+          // renueva su ventana de servicio de 24hs.
+          await registrarMensajeEntrante(numeroMeta);
 
           if (mensaje.type === 'text')        respuestaCliente = mensaje.text?.body?.toLowerCase()?.trim() || '';
           else if (mensaje.type === 'button') respuestaCliente = mensaje.button?.text?.toLowerCase()?.trim() || '';
