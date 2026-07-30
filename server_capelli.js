@@ -146,29 +146,37 @@ async function puedeEnviar(companyId = COMPANY_ID) {
 }
 
 // categoria: para qué se usó el mensaje — mismo desglose que server.js
+// 🆓 Categorías que caen dentro de una ventana de servicio ya abierta
+// por el cliente — no generan cobro nuevo de Meta en la práctica. Se
+// registran en el desglose, pero NO suman al "count" que compite
+// contra el límite mensual.
+const CATEGORIAS_GRATIS = ['respuestaCliente', 'agradecimiento'];
+
 async function consumirCupo(companyId = COMPANY_ID, categoria = 'otro') {
   const paidUntil = await obtenerPaidUntil();
   const cicloId = obtenerCicloId(paidUntil);
   const ref = db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`);
+  const esGratis = CATEGORIAS_GRATIS.includes(categoria);
   try {
     const r = await db.runTransaction(async (t) => {
       const snap = await t.get(ref);
       const actual = snap.exists ? (snap.data().count || 0) : 0;
       const desgloseActual = snap.exists ? (snap.data().desglose || {}) : {};
       const nuevoDesglose = { ...desgloseActual, [categoria]: (desgloseActual[categoria] || 0) + 1 };
+      const nuevoCount = esGratis ? actual : actual + 1;
       t.set(ref, {
         companyId,
         plan: 'empresarial',
         mes: fechaPY().slice(0, 7),
         cicloId,
-        count: actual + 1,
+        count: nuevoCount,
         limit: WHATSAPP_MENSUAL_LIMIT,
         desglose: nuevoDesglose,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
-      return { consumido: true, count: actual + 1 };
+      return { consumido: true, count: nuevoCount };
     });
-    console.log(`📊 [Capelli] usa ${r.count}/${WHATSAPP_MENSUAL_LIMIT} msgs en su ciclo actual (${cicloId}). (${categoria})`);
+    console.log(`📊 [Capelli] usa ${r.count}/${WHATSAPP_MENSUAL_LIMIT} msgs en su ciclo actual (${cicloId}). (${categoria}${esGratis ? ' — gratis, no sumó' : ''})`);
     return r;
   } catch (e) {
     console.error('❌ [Capelli] Error en consumirCupo:', e.message);
