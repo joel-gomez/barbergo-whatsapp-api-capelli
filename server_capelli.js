@@ -330,6 +330,21 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
       return false;
     }
     console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero}`);
+
+    // 📋 Historial de mensajes — para el panel de "Mensajes" de Capelli.
+    try {
+      await db.collection('message_log').add({
+        companyId,
+        phone: numero,
+        clientName: params[0] ? String(params[0]) : null,
+        templateName,
+        categoria,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('⚠️ [Capelli] [Historial mensajes] No se pudo registrar:', e.message);
+    }
+
     const esGratis = await ventanaAbierta(numero, companyId);
     await consumirCupo(companyId, categoria, esGratis);
     if (esIniciadoPorNegocio) await registrarAlcanceMeta(numero);
