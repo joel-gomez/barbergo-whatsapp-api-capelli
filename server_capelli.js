@@ -104,6 +104,21 @@ async function registrarMensajeEntrante(phone, companyId = COMPANY_ID) {
   }
 }
 
+// 💬 Guarda el texto CRUDO entrante para la vista de chat del panel.
+async function registrarMensajeChat(phone, companyId, texto) {
+  try {
+    const cleanPhone = String(phone || '').replace(/\D/g, '');
+    if (!cleanPhone || !companyId || !texto) return;
+    await db.collection('chat_messages').add({
+      companyId, phone: cleanPhone, direction: 'inbound',
+      text: String(texto).slice(0, 1000),
+      sentAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e) {
+    console.error('⚠️ [Capelli] [Chat] No se pudo registrar mensaje entrante:', e.message);
+  }
+}
+
 async function ventanaAbierta(phone, companyId = COMPANY_ID) {
   try {
     const cleanPhone = String(phone || '').replace(/\D/g, '');
@@ -345,6 +360,18 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
       console.error('⚠️ [Capelli] [Historial mensajes] No se pudo registrar:', e.message);
     }
 
+    // 💬 Mismo envío, ahora en el chat.
+    try {
+      await db.collection('chat_messages').add({
+        companyId, phone: numero, direction: 'outbound',
+        templateName, categoria,
+        variables: (params || []).slice(0, 8).map(v => String(v)),
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('⚠️ [Capelli] [Chat] No se pudo registrar mensaje saliente:', e.message);
+    }
+
     const esGratis = await ventanaAbierta(numero, companyId);
     await consumirCupo(companyId, categoria, esGratis);
     if (esIniciadoPorNegocio) await registrarAlcanceMeta(numero);
@@ -439,6 +466,60 @@ app.post('/api/enviar-mensaje', async (req, res) => {
   }
 });
 
+// 💬 TEXTO LIBRE — para la vista de chat del panel. Solo funciona si el
+// cliente escribió en las últimas 24hs (regla de WhatsApp, sin
+// excepción). No toca el cupo — un mensaje dentro de la ventana ya es
+// gratis por definición.
+app.post('/api/enviar-texto-libre', async (req, res) => {
+  try {
+    const { phone, text, companyId, locationId } = req.body;
+    if (!phone || !text || !String(text).trim()) return res.status(400).json({ success: false, error: 'Faltan datos' });
+
+    if ((companyId || locationId) && !(await perteneceACapelli({ companyId, locationId }))) {
+      return reenviarABarberGo('/api/enviar-texto-libre', req.body, res);
+    }
+
+    const cid = companyId || COMPANY_ID;
+    const cleanPhone = normalizarNumeroPY(phone);
+
+    const abierta = await ventanaAbierta(cleanPhone, cid);
+    if (!abierta) {
+      return res.status(200).json({ success: false, blocked: 'ventana_cerrada', error: 'La ventana de 24hs con este cliente está cerrada — solo se puede responder con plantillas aprobadas.' });
+    }
+
+    const payload = {
+      messaging_product: 'whatsapp', to: cleanPhone, type: 'text',
+      text: { body: String(text).slice(0, 4000) }
+    };
+    const resp = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      console.error('❌ [Capelli] Error Meta [texto libre]:', JSON.stringify(data));
+      return res.status(200).json({ success: false, error: 'Meta rechazó el mensaje' });
+    }
+    console.log(`✅ [Capelli] Texto libre enviado a ${cleanPhone}`);
+
+    try {
+      await db.collection('chat_messages').add({
+        companyId: cid, phone: cleanPhone, direction: 'outbound',
+        text: String(text).slice(0, 4000),
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.error('⚠️ [Capelli] [Chat] No se pudo registrar texto libre saliente:', e.message);
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('❌ Error en /api/enviar-texto-libre:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 app.post('/api/reserva-completada', async (req, res) => {
   try {
     const { bookingId } = req.body;
@@ -524,18 +605,21 @@ app.post('/webhook', async (req, res) => {
         for (const mensaje of value.messages) {
           const numeroMeta    = mensaje.from || '';
           const telefonoLocal = numeroMetaALocal(numeroMeta);
-          let respuestaCliente = '';
+
+          // Texto CRUDO (para el chat) aparte de la versión en
+          // minúsculas que ya usa el bot para reconocer "sí"/"no"/etc.
+          let textoCrudo = '';
+          if (mensaje.type === 'text')        textoCrudo = mensaje.text?.body || '';
+          else if (mensaje.type === 'button') textoCrudo = mensaje.button?.text || '';
+          else if (mensaje.type === 'interactive') {
+            textoCrudo = mensaje.interactive?.button_reply?.title || mensaje.interactive?.list_reply?.title || '';
+          }
+          let respuestaCliente = textoCrudo.toLowerCase().trim();
 
           // 🕐 Se registra ante CUALQUIER mensaje del cliente — abre/
-          // renueva su ventana de servicio de 24hs.
+          // renueva su ventana de servicio de 24hs, y queda en el chat.
           await registrarMensajeEntrante(numeroMeta);
-
-          if (mensaje.type === 'text')        respuestaCliente = mensaje.text?.body?.toLowerCase()?.trim() || '';
-          else if (mensaje.type === 'button') respuestaCliente = mensaje.button?.text?.toLowerCase()?.trim() || '';
-          else if (mensaje.type === 'interactive') {
-            respuestaCliente = mensaje.interactive?.button_reply?.title?.toLowerCase()?.trim() ||
-              mensaje.interactive?.list_reply?.title?.toLowerCase()?.trim() || '';
-          }
+          if (textoCrudo) await registrarMensajeChat(numeroMeta, COMPANY_ID, textoCrudo);
 
           console.log(`📞 [Capelli] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}"`);
 
