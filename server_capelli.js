@@ -344,6 +344,8 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
       console.error(`❌ [Capelli] Error Meta [${templateName}]:`, JSON.stringify(data));
       return false;
     }
+    const respData = await resp.json().catch(() => ({}));
+    const metaMessageId = respData?.messages?.[0]?.id || null;
     console.log(`✅ [Capelli] Template '${templateName}' enviado a ${numero}`);
 
     // 📋 Historial de mensajes — para el panel de "Mensajes" de Capelli.
@@ -366,6 +368,8 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
         companyId, phone: numero, direction: 'outbound',
         templateName, categoria,
         variables: (params || []).slice(0, 8).map(v => String(v)),
+        metaMessageId,
+        status: 'sent',
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (e) {
@@ -501,12 +505,16 @@ app.post('/api/enviar-texto-libre', async (req, res) => {
       console.error('❌ [Capelli] Error Meta [texto libre]:', JSON.stringify(data));
       return res.status(200).json({ success: false, error: 'Meta rechazó el mensaje' });
     }
+    const respData = await resp.json().catch(() => ({}));
+    const metaMessageId = respData?.messages?.[0]?.id || null;
     console.log(`✅ [Capelli] Texto libre enviado a ${cleanPhone}`);
 
     try {
       await db.collection('chat_messages').add({
         companyId: cid, phone: cleanPhone, direction: 'outbound',
         text: String(text).slice(0, 4000),
+        metaMessageId,
+        status: 'sent',
         sentAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } catch (e) {
@@ -600,6 +608,26 @@ app.post('/webhook', async (req, res) => {
       for (const change of entry.changes || []) {
         const value = change.value || {};
         if (value.metadata?.phone_number_id !== PHONE_NUMBER_ID) continue;
+
+        // 📬 ACTUALIZACIONES DE ESTADO (entregado/leído) — pueden venir
+        // solas, sin mensajes en el mismo payload, así que se procesan
+        // ANTES del "continue" de abajo.
+        if (Array.isArray(value.statuses)) {
+          for (const estado of value.statuses) {
+            try {
+              const metaId = estado.id;
+              const nuevoStatus = estado.status;
+              if (!metaId || !nuevoStatus) continue;
+              const snapEstado = await db.collection('chat_messages').where('metaMessageId', '==', metaId).limit(1).get();
+              if (!snapEstado.empty) {
+                await snapEstado.docs[0].ref.update({ status: nuevoStatus, statusUpdatedAt: admin.firestore.FieldValue.serverTimestamp() });
+              }
+            } catch (e) {
+              console.error('⚠️ [Capelli] Error actualizando estado de mensaje:', e.message);
+            }
+          }
+        }
+
         if (!value.messages) continue;
 
         for (const mensaje of value.messages) {
