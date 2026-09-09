@@ -634,6 +634,54 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
   await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false, 'agradecimiento');
 }
 
+// =====================================================================
+// 🧪 AUTOCONFIRMACIÓN DE TURNO INMINENTE — atrás del flag
+// pruebaFlujoWhatsapp. Si un turno queda a menos de 60 minutos (y no
+// más de 15 en el pasado, por si el cron tarda en pasar), se confirma
+// directo, sin pasar por el flujo normal de solicitud + recordatorio +
+// espera de respuesta — no tiene sentido pedirle al cliente que
+// confirme algo que va a pasar en minutos. Mismo patrón que ya existe
+// en el servidor compartido (server.js).
+// =====================================================================
+async function autoconfirmarReserva(reserva, docIdFallback, origen = 'Auto') {
+  const groupId = reserva.bookingGroupId;
+
+  if (groupId) {
+    const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
+    const yaConfirmado = bloquesSnap.docs.some(d => d.data().confirmedAutomatically);
+    if (yaConfirmado) {
+      console.log(`⏭️ [Capelli ${origen}] Grupo ${String(groupId).slice(-5)} ya autoconfirmado — ignorando`);
+      return false;
+    }
+    const batch = db.batch();
+    bloquesSnap.forEach(d => batch.update(d.ref, {
+      status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }));
+    await batch.commit();
+    console.log(`✅ [Capelli ${origen}] ${bloquesSnap.size} bloque(s) confirmado(s)`);
+  } else {
+    if (reserva.confirmedAutomatically) {
+      console.log(`⏭️ [Capelli ${origen}] Ya autoconfirmado — ignorando`);
+      return false;
+    }
+    await db.collection('bookings').doc(docIdFallback).update({
+      status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  }
+
+  if (reserva.isPrimary !== false) {
+    const cleanPhoneAuto = normalizarNumeroPY(reserva.client?.phone);
+    const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+    const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+    const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
+    await enviarTemplate(cleanPhoneAuto, TEMPLATES.confirmada, variables, COMPANY_ID, true, true, 'confirmadaAuto');
+    console.log(`📤 [Capelli ${origen}] confirmación enviada a ${cleanPhoneAuto}`);
+  }
+  return true;
+}
+
 // ========================================
 // RUTAS
 // ========================================
@@ -984,6 +1032,36 @@ cron.schedule('*/15 * * * *', async () => {
     const py = horaParaguay();
     const todayStr = py.dateStr;
 
+    // 🧪 A pedido: respaldo del listener en tiempo real (más abajo) —
+    // si por algún motivo el listener no llegó a autoconfirmar un
+    // turno inminente (ej: el server se reinició justo en ese
+    // momento), este chequeo cada 15 min lo agarra igual. Solo corre
+    // si el flag de prueba está activo para Capelli.
+    if (await pruebaFlujoWhatsappActiva()) {
+      try {
+        const pendientesSnap = await db.collection('bookings')
+          .where('date', '==', todayStr)
+          .where('locationId', 'in', LOCATION_IDS)
+          .where('status', 'in', ['pending', 'confirmed'])
+          .where('isPrimary', '==', true)
+          .get();
+
+        for (const doc of pendientesSnap.docs) {
+          const reserva = doc.data();
+          if (reserva.confirmedAutomatically) continue;
+          const timeStr = reserva.startTime || reserva.time;
+          if (!timeStr) continue;
+          const diff = minutosHastaTurno(timeStr, py);
+          if (diff !== null && diff >= -15 && diff < 60) {
+            console.log(`⚡ [Capelli Cron] Turno en ${diff} min — autoconfirmando (respaldo)`);
+            await autoconfirmarReserva(reserva, doc.id, 'Cron');
+          }
+        }
+      } catch (eImin) {
+        console.error('❌ [Capelli Cron] Error en respaldo de turnos inminentes:', eImin.message);
+      }
+    }
+
     const snapshot = await db.collection('bookings')
       .where('date', '==', todayStr)
       .where('locationId', 'in', LOCATION_IDS)
@@ -1045,3 +1123,48 @@ app.listen(PORT, () => {
   console.log(`💳 Cupo mensual WhatsApp: ${WHATSAPP_MENSUAL_LIMIT} msgs/mes`);
   console.log(`📡 Alcance compartido con el bot de BarberGo vía meta_reach_daily (mismo Business Portfolio)`);
 });
+
+// =====================================================================
+// 🧪 LISTENER EN TIEMPO REAL — turno inminente, atrás del flag
+// pruebaFlujoWhatsapp. El cron de arriba corre cada 15 minutos, que
+// puede ser demasiado tarde para un turno que se crea con, por
+// ejemplo, 10 minutos de anticipación — para cuando el cron pasa, el
+// turno ya sucedió. Este listener reacciona al instante apenas se crea
+// la reserva. Mismo patrón que ya usa el servidor compartido
+// (server.js).
+// =====================================================================
+let capelliListenerReady = false;
+setTimeout(() => {
+  db.collection('bookings')
+    .where('locationId', 'in', LOCATION_IDS)
+    .where('status', 'in', ['pending', 'confirmed'])
+    .onSnapshot(async (snapshot) => {
+      if (!capelliListenerReady) { capelliListenerReady = true; console.log('👂 [Capelli] Escuchador de turnos inminentes activo'); return; }
+      for (const change of snapshot.docChanges()) {
+        if (change.type !== 'added') continue;
+        const booking = change.doc.data();
+        if (!booking.isPrimary || booking.confirmedAutomatically) continue;
+
+        let bookingCreatedAt = 0;
+        if (booking.createdAt?.toMillis) bookingCreatedAt = booking.createdAt.toMillis();
+        else if (booking.createdAt?.seconds) bookingCreatedAt = booking.createdAt.seconds * 1000;
+        if (bookingCreatedAt > 0 && Date.now() - bookingCreatedAt > 300000) continue; // solo reservas recién creadas
+
+        try {
+          if (!(await pruebaFlujoWhatsappActiva())) continue;
+          const py = horaParaguay();
+          if (booking.date !== py.dateStr) continue;
+          const timeStr = booking.startTime || booking.time || '';
+          if (!timeStr) continue;
+          const diff = minutosHastaTurno(timeStr, py);
+          console.log(`🔍 [Capelli Listener] fecha: ${booking.date} | hora: ${timeStr} | diff: ${diff} min`);
+          if (diff !== null && diff >= -15 && diff < 60) {
+            console.log(`⚡ [Capelli Listener] Turno en ${diff} min — autoconfirmando`);
+            await autoconfirmarReserva(booking, change.doc.id, 'Listener');
+          }
+        } catch (eAuto) {
+          console.error('❌ [Capelli Listener] Error en autoconfirmación:', eAuto.message);
+        }
+      }
+    });
+}, 3000);
