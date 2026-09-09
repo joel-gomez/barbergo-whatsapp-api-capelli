@@ -164,6 +164,29 @@ async function obtenerPaidUntil() {
   }
 }
 
+// 🧪 Flag de prueba — agrupa todos los cambios de ahorro de mensajes
+// que todavía se están validando (texto libre en vez de plantilla).
+// Se activa desde SuperAdmin, empresa por empresa — Capelli solo lo
+// usa si Joel lo activó explícitamente para esta empresa puntual.
+let PRUEBA_FLUJO_CACHE = { value: undefined, cachedAt: 0 };
+const PRUEBA_FLUJO_TTL_MS = 60 * 1000;
+
+async function pruebaFlujoWhatsappActiva() {
+  const ahora = Date.now();
+  if (PRUEBA_FLUJO_CACHE.value !== undefined && (ahora - PRUEBA_FLUJO_CACHE.cachedAt) < PRUEBA_FLUJO_TTL_MS) {
+    return PRUEBA_FLUJO_CACHE.value;
+  }
+  try {
+    const snap = await db.collection('companies').doc(COMPANY_ID).get();
+    const activa = !!(snap.exists && snap.data().enabledFeatures?.pruebaFlujoWhatsapp);
+    PRUEBA_FLUJO_CACHE = { value: activa, cachedAt: ahora };
+    return activa;
+  } catch (e) {
+    console.error('⚠️ [Capelli] Error obteniendo pruebaFlujoWhatsapp:', e.message);
+    return false;
+  }
+}
+
 function obtenerCicloId(paidUntil) {
   if (paidUntil) {
     try {
@@ -174,6 +197,79 @@ function obtenerCicloId(paidUntil) {
     } catch (e) { /* cae al respaldo de abajo */ }
   }
   return fechaPY().slice(0, 7);
+}
+
+// =====================================================================
+// ⭐ LÍMITE DE RESEÑAS MENSUALES (ALEATORIO) — a pedido, para cuando el
+// pago mensual de la empresa es bajo y no conviene absorber el costo
+// de pedir calificación en CADA turno completado. Configurable desde
+// el SuperAdmin (companies/{COMPANY_ID}.maxReviewRequestsPerMonth) —
+// null/0 = sin límite, se sigue pidiendo en todos como siempre.
+//
+// No es "los primeros N del mes" — cada turno elegible tira una
+// moneda (40% de probabilidad) antes de chequear el tope, así la
+// selección queda repartida a lo largo del mes en vez de agotarse
+// apenas empieza. Una vez alcanzado el tope, no se manda más aunque
+// la moneda salga a favor.
+//
+// Contador propio en 'rating_requests_monthly' (mismo patrón de
+// ciclo que usage_monthly, pero en su propia colección para no
+// mezclar con el cupo de plantillas).
+// =====================================================================
+let MAX_REVIEWS_CACHE = { value: undefined, cachedAt: 0 };
+const MAX_REVIEWS_TTL_MS = 60 * 1000;
+
+async function obtenerMaxReviewsPorMes() {
+  const ahora = Date.now();
+  if (MAX_REVIEWS_CACHE.value !== undefined && (ahora - MAX_REVIEWS_CACHE.cachedAt) < MAX_REVIEWS_TTL_MS) {
+    return MAX_REVIEWS_CACHE.value;
+  }
+  try {
+    const snap = await db.collection('companies').doc(COMPANY_ID).get();
+    const data = snap.exists ? snap.data() : {};
+    const limite = (typeof data.maxReviewRequestsPerMonth === 'number' && data.maxReviewRequestsPerMonth > 0)
+      ? data.maxReviewRequestsPerMonth
+      : null;
+    MAX_REVIEWS_CACHE = { value: limite, cachedAt: ahora };
+    return limite;
+  } catch (e) {
+    console.error('⚠️ [Capelli] Error obteniendo maxReviewRequestsPerMonth:', e.message);
+    return null;
+  }
+}
+
+// Devuelve true si ESTE turno puntual debe recibir el pedido de
+// calificación (respetando el límite mensual configurado, si hay
+// uno). Si no hay límite configurado, siempre devuelve true (se
+// mantiene el comportamiento de siempre: pedir en todos).
+const PROBABILIDAD_SELECCION = 0.4; // 40% de chance por turno elegible, repartido en el mes
+
+async function debeEnviarCalificacionAleatoria() {
+  const limite = await obtenerMaxReviewsPorMes();
+  if (!limite) return true; // sin límite configurado — comportamiento de siempre
+
+  const paidUntil = await obtenerPaidUntil();
+  const cicloId = obtenerCicloId(paidUntil);
+  const ref = db.collection('rating_requests_monthly').doc(`${COMPANY_ID}_${cicloId}`);
+
+  try {
+    const resultado = await db.runTransaction(async (t) => {
+      const snap = await t.get(ref);
+      const actual = snap.exists ? (snap.data().count || 0) : 0;
+
+      if (actual >= limite) return false; // tope ya alcanzado este ciclo
+
+      const seleccionado = Math.random() < PROBABILIDAD_SELECCION;
+      if (!seleccionado) return false; // no le tocó esta vez
+
+      t.set(ref, { companyId: COMPANY_ID, cicloId, count: actual + 1, limit: limite, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      return true;
+    });
+    return resultado;
+  } catch (e) {
+    console.error('⚠️ [Capelli] Error chequeando límite de reseñas:', e.message);
+    return true; // ante la duda, no cortamos la función — se manda igual
+  }
 }
 
 // =====================================================================
@@ -386,9 +482,117 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
   }
 }
 
+// =====================================================================
+// 📊 CONTADOR DE MENSAJES DE SERVICIO (texto libre, no plantilla)
+// ---------------------------------------------------------------------
+// Hoy estos mensajes son gratis (van dentro de una ventana de servicio
+// ya abierta). A partir del 1 de octubre de 2026, Meta empieza a cobrar
+// también por estos — así que medimos volumen desde ya para saber el
+// impacto real de costo antes de que empiece a facturarse, sin bloquear
+// ni cambiar el comportamiento actual. Colección compartida con
+// server.js (mismo proyecto de Firebase) — el conteo sale combinado.
+// =====================================================================
+async function contarMensajeServicio() {
+  try {
+    const hoy = fechaPY();
+    await db.collection('service_text_daily').doc(hoy).set({
+      count: admin.firestore.FieldValue.increment(1),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Capelli] [Servicio] No se pudo contar mensaje de texto libre:', e.message);
+  }
+}
+
+// =====================================================================
+// 💬 ENVIAR TEXTO LIBRE (interno, no HTTP) — usado cuando el cliente
+// ACABA de escribir (confirmar/cancelar/comentario) y por eso ya
+// sabemos con certeza que la ventana de servicio de 24hs está abierta.
+// A partir del 1° de octubre de 2026, las plantillas dentro de ventana
+// empiezan a cobrar exactamente lo mismo que afuera de ventana — pero
+// el texto libre sigue teniendo 1.000 mensajes gratis por mes, por
+// número (ver el anuncio de Meta). Usar texto libre acá en vez de
+// plantilla ahorra ese costo, sin cambiar la esencia de lo que recibe
+// el cliente. No toca el "cupo mensual" (consumirCupo/límite del plan)
+// — ese sistema es específicamente para plantillas; el texto libre se
+// mide aparte con contarMensajeServicio(), para el nuevo tramo de Meta.
+// =====================================================================
+async function enviarTextoLibreInterno(numero, mensaje, companyId = COMPANY_ID, categoria = 'otro') {
+  try {
+    const cleanPhone = String(numero).replace(/\D/g, '');
+    const payload = {
+      messaging_product: 'whatsapp', to: cleanPhone, type: 'text',
+      text: { body: String(mensaje).slice(0, 4000) }
+    };
+    const response = await fetch(`https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) {
+      const errData = await response.json().catch(() => ({}));
+      console.error('❌ [Capelli] Error Meta [texto libre interno]:', JSON.stringify(errData));
+      return false;
+    }
+    const respData = await response.json().catch(() => ({}));
+    const metaMessageId = respData?.messages?.[0]?.id || null;
+    console.log(`✅ [Capelli] Texto libre interno enviado a ${cleanPhone}`);
+
+    if (companyId) {
+      try {
+        await db.collection('message_log').add({
+          companyId, phone: cleanPhone, clientName: null,
+          templateName: null, textoLibre: true, categoria,
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) { console.error('⚠️ [Capelli] [Historial] No se pudo registrar texto libre:', e.message); }
+
+      try {
+        await db.collection('chat_messages').add({
+          companyId, phone: cleanPhone, direction: 'outbound',
+          text: String(mensaje).slice(0, 4000),
+          categoria, metaMessageId, status: 'sent',
+          sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      } catch (e) { console.error('⚠️ [Capelli] [Chat] No se pudo registrar texto libre saliente:', e.message); }
+
+      await contarMensajeServicio();
+    }
+    return true;
+  } catch (error) {
+    console.error('❌ [Capelli] Error enviando texto libre interno:', error);
+    return false;
+  }
+}
+
 async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, esIniciadoPorNegocio = true) {
   const { shopName, mapLink, shopUrl } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+
+  // 🧪 A pedido: el texto libre (en vez de plantilla) queda atrás del
+  // feature flag "pruebaFlujoWhatsapp" — mientras Capelli no lo tenga
+  // activado desde SuperAdmin, sigue mandando plantilla como siempre.
+  const usarTextoLibre = !esIniciadoPorNegocio && await pruebaFlujoWhatsappActiva();
+
+  // 💬 Si esto es una RESPUESTA a algo que el cliente acaba de
+  // escribir Y el flag de prueba está activo, la ventana de 24hs está
+  // garantizado abierta en este instante — se manda como TEXTO LIBRE
+  // en vez de plantilla, mismo motivo que en server.js (ver
+  // comentario de enviarTextoLibreInterno). El texto es nuevo, no pasó
+  // por aprobación de Meta — conviene que Joel lo revise antes de
+  // activar el flag para más empresas.
+  if (usarTextoLibre) {
+    let mensaje;
+    if (nuevoEstado === 'confirmed') {
+      mensaje = `¡Gracias, ${clientName}! ✅ Tu turno en *${shopName}* quedó confirmado para el *${formattedDate} a las ${timeStr}* con ${barberName}.\n\n${serviceName} — Gs ${servicePrice}\nTicket: ${tId}\n\n📍 ${mapLink}\n\n¡Te esperamos!`;
+    } else {
+      mensaje = `Listo, ${clientName}. Cancelamos tu turno del ${formattedDate} a las ${timeStr}. Si querés reagendar, entrá a ${shopUrl} 🙌`;
+    }
+    const enviado = await enviarTextoLibreInterno(numeroMeta, mensaje, COMPANY_ID, 'respuestaCliente');
+    if (enviado) return;
+    console.log('⚠️ [Capelli] Texto libre falló, usando plantilla de respaldo');
+  }
+
   const templateName = nuevoEstado === 'confirmed' ? TEMPLATES.confirmada : TEMPLATES.cancelada;
   const linkFinal    = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
   const categoria = !esIniciadoPorNegocio
@@ -418,6 +622,15 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
     const plan = snap.data().plan?.toLowerCase() || '';
     if (plan !== 'empresarial' && plan !== 'premium') return;
   } catch (e) { return; }
+
+  // 🧪 Mismo flag de prueba que enviarRespuestaWhatsApp — mientras no
+  // esté activado, cae directo a la plantilla de siempre.
+  if (await pruebaFlujoWhatsappActiva()) {
+    const mensaje = `¡Gracias por tu reseña! 🙌 Nos alegra mucho que hayas tenido una buena experiencia. ¡Te esperamos la próxima!`;
+    const enviado = await enviarTextoLibreInterno(normalizarNumeroPY(telefonoLocal), mensaje, COMPANY_ID, 'agradecimiento');
+    if (enviado) return;
+    console.log('⚠️ [Capelli] Texto libre de agradecimiento falló, usando plantilla de respaldo');
+  }
   await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false, 'agradecimiento');
 }
 
@@ -561,6 +774,16 @@ app.post('/api/reserva-completada', async (req, res) => {
       console.log(`⏭️ [Capelli] Reserva del ${fechaReserva} fuera de ventana 24hs — calificación omitida`);
       await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
       return res.status(200).json({ success: true, message: 'Reserva fuera de ventana de 24hs — calificación omitida' });
+    }
+
+    // ⭐ Límite de reseñas mensuales (aleatorio) — si esta empresa tiene
+    // configurado un tope (ej: Capelli, 20/mes), este turno puntual
+    // puede quedar afuera de la selección aunque cumpla todo lo demás.
+    const seleccionadoParaCalificar = await debeEnviarCalificacionAleatoria();
+    if (!seleccionadoParaCalificar) {
+      console.log(`🎲 [Capelli] Turno no seleccionado para calificación (límite mensual o no le tocó esta vez)`);
+      await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
+      return res.status(200).json({ success: true, message: 'No seleccionado para calificación este mes' });
     }
 
     console.log(`💈 [Capelli] Cuenta EMPRESARIAL. Solicitando calificación con: ${TEMPLATES.calificacion}`);
