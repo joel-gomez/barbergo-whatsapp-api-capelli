@@ -29,9 +29,9 @@ const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo
 
 const TEMPLATES = {
   solicitud:      'solicitud_reserva_capelli_v1',
-  confirmada:     'reserva_confirmada_capelli_v1',
+  confirmada:     'reserva_confirmada_capelli_v3',
   cancelada:      'reserva_cancelada_capelli_v1',
-  recordatorio:   'recordatorio_turno_capelli_v1',
+  recordatorio:   'recordatorio_de_turno_capelli',
   calificacion:   'calificar_barbero_capelli_v1',
   agradecimiento: 'agradecimiento_capelli_v1'
 };
@@ -69,6 +69,24 @@ function minutosHastaTurno(startTimeStr, pyNow) {
   if (!startTimeStr) return null;
   const [h, m] = startTimeStr.split(':').map(Number);
   return (h * 60 + m) - pyNow.minutosDelDia;
+}
+
+// 🔧 A pedido — igual que minutosHastaTurno, pero cruzando la FECHA
+// completa del turno (no solo la hora del día), para que funcione bien
+// sin importar cuántos días falten. _ahoraPY() ya devuelve "ahora"
+// corrido a hora de Paraguay pero representado como si fuera UTC — acá
+// construimos la fecha del turno de la misma manera, para que la resta
+// dé el minutaje real sin líos de zona horaria.
+function minutosHastaTurnoCompleto(fechaStr, horaStr) {
+  if (!fechaStr || !horaStr) return null;
+  try {
+    const turnoNaive = new Date(`${fechaStr}T${horaStr}:00Z`);
+    if (isNaN(turnoNaive.getTime())) return null;
+    const ahoraNaive = _ahoraPY();
+    return Math.round((turnoNaive.getTime() - ahoraNaive.getTime()) / 60000);
+  } catch (e) {
+    return null;
+  }
 }
 
 async function registrarAlcanceMeta(phone) {
@@ -584,9 +602,9 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, esInici
   if (usarTextoLibre) {
     let mensaje;
     if (nuevoEstado === 'confirmed') {
-      mensaje = `¡Gracias, ${clientName}! ✅ Tu turno en *${shopName}* quedó confirmado para el *${formattedDate} a las ${timeStr}* con ${barberName}.\n\n${serviceName} — Gs ${servicePrice}\nTicket: ${tId}\n\n📍 ${mapLink}\n\n¡Te esperamos!`;
+      mensaje = `¡Turno Confirmado!\n¡Hola ${clientName}! 💈\n\nConfirmaste tu turno en ${shopName} 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
     } else {
-      mensaje = `Listo, ${clientName}. Cancelamos tu turno del ${formattedDate} a las ${timeStr}. Si querés reagendar, entrá a ${shopUrl} 🙌`;
+      mensaje = `Reserva Cancelada\nHola ${clientName} 👋\n\nTu turno en ${shopName} fue cancelado ❌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr}\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\nPodés reagendar tu turno cuando quieras 👇\n📲 ${shopUrl}\n\n¡Hasta pronto! 🙌\nPlataforma Gestionada por Barber Go`;
     }
     const enviado = await enviarTextoLibreInterno(numeroMeta, mensaje, COMPANY_ID, 'respuestaCliente');
     if (enviado) return;
@@ -612,6 +630,27 @@ async function enviarCalificacionWhatsApp(reserva) {
   const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
   if (!cleanPhone) return;
   const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
+
+  // 🧪 A pedido: con el flag activo, la calificación SOLO se manda si
+  // la ventana de 24hs está abierta en este momento (como texto
+  // libre). Si está cerrada, NO se manda nada — sin plantilla de
+  // respaldo — para maximizar el ahorro. Esto es a propósito distinto
+  // del comportamiento de server.js (que sí cae a plantilla si la
+  // ventana está cerrada); acá Joel prefiere perder el pedido de
+  // calificación antes que pagar la plantilla.
+  if (await pruebaFlujoWhatsappActiva()) {
+    const abierta = await ventanaAbierta(cleanPhone, COMPANY_ID);
+    if (!abierta) {
+      console.log('⏭️ [Capelli] Calificación omitida — ventana cerrada, no se manda plantilla de respaldo');
+      return;
+    }
+    const mensaje = `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
+    const enviado = await enviarTextoLibreInterno(cleanPhone, mensaje, COMPANY_ID, 'calificacion');
+    if (enviado) return;
+    console.log('⚠️ [Capelli] Texto libre de calificación falló — no se manda plantilla de respaldo');
+    return;
+  }
+
   await enviarTemplate(cleanPhone, TEMPLATES.calificacion, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero'], COMPANY_ID, false, true, 'calificacion');
 }
 
@@ -626,12 +665,63 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
   // 🧪 Mismo flag de prueba que enviarRespuestaWhatsApp — mientras no
   // esté activado, cae directo a la plantilla de siempre.
   if (await pruebaFlujoWhatsappActiva()) {
-    const mensaje = `¡Gracias por tu reseña! 🙌 Nos alegra mucho que hayas tenido una buena experiencia. ¡Te esperamos la próxima!`;
+    const mensaje = `Opinión recibida correctamente.\n\nGracias por responder.`;
     const enviado = await enviarTextoLibreInterno(normalizarNumeroPY(telefonoLocal), mensaje, COMPANY_ID, 'agradecimiento');
     if (enviado) return;
     console.log('⚠️ [Capelli] Texto libre de agradecimiento falló, usando plantilla de respaldo');
   }
   await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false, 'agradecimiento');
+}
+
+// =====================================================================
+// 💾 GUARDAR CALIFICACIÓN — extraído para reusar tanto cuando el
+// cliente manda la calificación y el comentario JUNTOS en un solo
+// mensaje (ej: "5 excelente el servicio") como cuando los manda en dos
+// mensajes separados. Guarda la reseña, actualiza el promedio del
+// barbero, y manda el agradecimiento.
+// =====================================================================
+async function guardarCalificacion(telefonoLocal, stars, comment) {
+  const snapshot = await db.collection('bookings')
+    .where('client.phone', '==', telefonoLocal)
+    .where('locationId', 'in', LOCATION_IDS)
+    .where('status', '==', 'completed')
+    .orderBy('createdAt', 'desc').limit(3).get();
+
+  const bookingDoc = snapshot.docs.find(d => !d.data().isReviewed);
+  if (!bookingDoc) return false;
+
+  const booking    = bookingDoc.data();
+  const locationId = booking.locationId ? String(booking.locationId).trim() : null;
+  const barberId   = booking.barber?.id  ? String(booking.barber.id).trim()  : null;
+  if (!locationId || !barberId) { await bookingDoc.ref.update({ isReviewed: true }); return false; }
+
+  let barberRef = null;
+  const directSnap = await db.collection('locations').doc(locationId).collection('barbers').doc(barberId).get();
+  if (directSnap.exists) {
+    barberRef = directSnap.ref;
+  } else {
+    for (const idValue of [Number(barberId), barberId]) {
+      const q = await db.collection('locations').doc(locationId).collection('barbers').where('id', '==', idValue).limit(1).get();
+      if (!q.empty) { barberRef = q.docs[0].ref; break; }
+    }
+  }
+  if (!barberRef) { await bookingDoc.ref.update({ isReviewed: true }); return false; }
+
+  await db.runTransaction(async (t) => {
+    const barberDoc = await t.get(barberRef);
+    if (!barberDoc.exists) return;
+    const curr  = barberDoc.data().rating || 0;
+    const count = barberDoc.data().reviewsCount || 0;
+    const newCount = count + 1;
+    t.update(barberRef, { rating: parseFloat(((curr * count + stars) / newCount).toFixed(1)), reviewsCount: newCount });
+    t.update(bookingDoc.ref, { isReviewed: true, reviewStars: stars, reviewComment: comment });
+    t.set(barberRef.collection('reviews').doc(bookingDoc.id), {
+      clientId: booking.userId || telefonoLocal, clientName: booking.client?.name || 'Cliente',
+      stars: Number(stars), comment, createdAt: admin.firestore.FieldValue.serverTimestamp(), bookingId: bookingDoc.id
+    });
+  });
+  await enviarAgradecimientoWhatsApp(booking, telefonoLocal);
+  return true;
 }
 
 // =====================================================================
@@ -922,17 +1012,30 @@ app.post('/webhook', async (req, res) => {
 
           console.log(`📞 [Capelli] Mensaje de: ${numeroMeta} | Texto: "${respuestaCliente}"`);
 
-          const ratingMatch = respuestaCliente.trim().match(/^[1-5]$/);
-          if (ratingMatch) {
-            const stars = parseInt(ratingMatch[0]);
-            await db.collection('rating_sessions_capelli').doc(telefonoLocal).set({
-              stars, phone: telefonoLocal, companyId: COMPANY_ID,
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              expiresAt: new Date(Date.now() + 10 * 60 * 1000)
-            });
+          // 1. CALIFICACIÓN (1-5) — sola, o junto con el comentario en
+          // el mismo mensaje (ej: "5 excelente el servicio"). El \b
+          // evita que algo como "5000" se confunda con calificación.
+          const ratingComboMatch = respuestaCliente.trim().match(/^([1-5])\b\s*(.*)$/s);
+          if (ratingComboMatch) {
+            const stars = parseInt(ratingComboMatch[1]);
+            const comentarioInline = ratingComboMatch[2].trim();
+            if (comentarioInline) {
+              await guardarCalificacion(telefonoLocal, stars, comentarioInline);
+            } else {
+              await db.collection('rating_sessions_capelli').doc(telefonoLocal).set({
+                stars, phone: telefonoLocal, companyId: COMPANY_ID,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                // 🔧 A pedido: 10 min era muy poco tiempo real para escribir
+                // un comentario — si expiraba antes, ese texto caía en la
+                // lógica de confirmar/cancelar y podía disparar el mensaje
+                // de confirmación por segunda vez. Ahora son 60 minutos.
+                expiresAt: new Date(Date.now() + 60 * 60 * 1000)
+              });
+            }
             continue;
           }
 
+          // 2. COMENTARIO DE CALIFICACIÓN (cuando el número llegó solo)
           const sessionSnap = await db.collection('rating_sessions_capelli').doc(telefonoLocal).get();
           if (sessionSnap.exists) {
             const session   = sessionSnap.data();
@@ -941,47 +1044,7 @@ app.post('/webhook', async (req, res) => {
               const { stars } = session;
               const comment = respuestaCliente.trim();
               await db.collection('rating_sessions_capelli').doc(telefonoLocal).delete();
-
-              const snapshot = await db.collection('bookings')
-                .where('client.phone', '==', telefonoLocal)
-                .where('locationId', 'in', LOCATION_IDS)
-                .where('status', '==', 'completed')
-                .orderBy('createdAt', 'desc').limit(3).get();
-
-              const bookingDoc = snapshot.docs.find(d => !d.data().isReviewed);
-              if (!bookingDoc) continue;
-
-              const booking    = bookingDoc.data();
-              const locationId = booking.locationId ? String(booking.locationId).trim() : null;
-              const barberId   = booking.barber?.id  ? String(booking.barber.id).trim()  : null;
-              if (!locationId || !barberId) { await bookingDoc.ref.update({ isReviewed: true }); continue; }
-
-              let barberRef = null;
-              const directSnap = await db.collection('locations').doc(locationId).collection('barbers').doc(barberId).get();
-              if (directSnap.exists) {
-                barberRef = directSnap.ref;
-              } else {
-                for (const idValue of [Number(barberId), barberId]) {
-                  const q = await db.collection('locations').doc(locationId).collection('barbers').where('id', '==', idValue).limit(1).get();
-                  if (!q.empty) { barberRef = q.docs[0].ref; break; }
-                }
-              }
-              if (!barberRef) { await bookingDoc.ref.update({ isReviewed: true }); continue; }
-
-              await db.runTransaction(async (t) => {
-                const barberDoc = await t.get(barberRef);
-                if (!barberDoc.exists) return;
-                const curr  = barberDoc.data().rating || 0;
-                const count = barberDoc.data().reviewsCount || 0;
-                const newCount = count + 1;
-                t.update(barberRef, { rating: parseFloat(((curr * count + stars) / newCount).toFixed(1)), reviewsCount: newCount });
-                t.update(bookingDoc.ref, { isReviewed: true, reviewStars: stars, reviewComment: comment });
-                t.set(barberRef.collection('reviews').doc(bookingDoc.id), {
-                  clientId: booking.userId || telefonoLocal, clientName: booking.client?.name || 'Cliente',
-                  stars: Number(stars), comment, createdAt: admin.firestore.FieldValue.serverTimestamp(), bookingId: bookingDoc.id
-                });
-              });
-              await enviarAgradecimientoWhatsApp(booking, telefonoLocal);
+              await guardarCalificacion(telefonoLocal, stars, comment);
               continue;
             }
             await db.collection('rating_sessions_capelli').doc(telefonoLocal).delete();
@@ -1062,8 +1125,23 @@ cron.schedule('*/15 * * * *', async () => {
       }
     }
 
+    // 🔧 A pedido — Capelli tiene un esquema propio de recordatorio:
+    // - Si el cliente reservó el MISMO día del turno → recordatorio 3hs
+    //   antes (165-195 min)
+    // - Si reservó con anticipación (ej: lunes para el sábado) →
+    //   recordatorio 6hs antes (345-375 min)
+    // La distinción es por CUÁNDO SE HIZO LA RESERVA vs. la fecha del
+    // turno — no por si el turno cae hoy o mañana en el momento en que
+    // corre el cron (6hs antes de un turno casi siempre cae el MISMO
+    // día del turno, no el día anterior, así que revisar por fecha del
+    // turno no funcionaría bien acá).
+    // Se revisa un rango de hasta 7 días para adelante, para cubrir
+    // reservas hechas con bastante anticipación sin tener que barrer
+    // toda la colección.
+    const fechaLimite = fechaPY(7);
     const snapshot = await db.collection('bookings')
-      .where('date', '==', todayStr)
+      .where('date', '>=', todayStr)
+      .where('date', '<=', fechaLimite)
       .where('locationId', 'in', LOCATION_IDS)
       .where('status', '==', 'confirmed')
       .where('reminderSent', '==', false).get();
@@ -1072,10 +1150,27 @@ cron.schedule('*/15 * * * *', async () => {
       try {
         const reserva = doc.data();
         const timeStr = reserva.startTime || reserva.time;
-        if (!timeStr) continue;
+        if (!timeStr || !reserva.date) continue;
 
-        const diffMinutes = minutosHastaTurno(timeStr, py);
-        if (diffMinutes !== null && diffMinutes >= 105 && diffMinutes <= 135) {
+        const diffMinutes = minutosHastaTurnoCompleto(reserva.date, timeStr);
+        if (diffMinutes === null) continue;
+
+        // ¿Se reservó el mismo día del turno, o con anticipación?
+        // Comparamos la fecha del turno contra la fecha de creación de
+        // la reserva, convertida a hora de Paraguay.
+        let esReservaMismoDia = false;
+        let fechaCreacion = null;
+        if (reserva.createdAt?.toDate) fechaCreacion = reserva.createdAt.toDate();
+        else if (reserva.createdAt?.seconds) fechaCreacion = new Date(reserva.createdAt.seconds * 1000);
+        if (fechaCreacion) {
+          const dPY = new Date(fechaCreacion.getTime() + PY_OFFSET_MIN * 60 * 1000);
+          const fechaCreacionPY = `${dPY.getUTCFullYear()}-${String(dPY.getUTCMonth() + 1).padStart(2, '0')}-${String(dPY.getUTCDate()).padStart(2, '0')}`;
+          esReservaMismoDia = fechaCreacionPY === reserva.date;
+        }
+
+        const ventana = esReservaMismoDia ? { min: 165, max: 195 } : { min: 345, max: 375 };
+
+        if (diffMinutes >= ventana.min && diffMinutes <= ventana.max) {
           await db.collection('bookings').doc(doc.id).update({ reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
           await enviarRecordatorioWhatsApp(reserva);
         }
