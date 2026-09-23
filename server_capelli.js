@@ -31,7 +31,7 @@ const TEMPLATES = {
   solicitud:      'solicitud_reserva_capelli_v1',
   confirmada:     'reserva_confirmada_capelli_v3',
   cancelada:      'reserva_cancelada_capelli_v1',
-  recordatorio:   'recordatorio_de_turno_capelli',
+  recordatorio:   'recordatorio_confirmacion_capelli_v2',
   calificacion:   'calificar_barbero_capelli_v1',
   agradecimiento: 'agradecimiento_capelli_v1'
 };
@@ -631,27 +631,19 @@ async function enviarCalificacionWhatsApp(reserva) {
   if (!cleanPhone) return;
   const { shopName } = await obtenerDatosUbicacion(reserva.locationId);
 
-  // 🧪 A pedido: con el flag activo, la calificación SOLO se manda si
-  // la ventana de 24hs está abierta en este momento (como texto
-  // libre). Si está cerrada, NO se manda nada — sin plantilla de
-  // respaldo — para maximizar el ahorro. Esto es a propósito distinto
-  // del comportamiento de server.js (que sí cae a plantilla si la
-  // ventana está cerrada); acá Joel prefiere perder el pedido de
-  // calificación antes que pagar la plantilla.
-  if (await pruebaFlujoWhatsappActiva()) {
-    const abierta = await ventanaAbierta(cleanPhone, COMPANY_ID);
-    if (!abierta) {
-      console.log('⏭️ [Capelli] Calificación omitida — ventana cerrada, no se manda plantilla de respaldo');
-      return;
-    }
-    const mensaje = `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
-    const enviado = await enviarTextoLibreInterno(cleanPhone, mensaje, COMPANY_ID, 'calificacion');
-    if (enviado) return;
-    console.log('⚠️ [Capelli] Texto libre de calificación falló — no se manda plantilla de respaldo');
+  // 🔧 A pedido: la calificación de Capelli NUNCA manda plantilla —
+  // solo texto libre, sin excepción y sin importar el flag de prueba.
+  // Si la ventana de 24hs está cerrada, directamente no se manda nada
+  // (se pierde ese pedido de calificación puntual, mismo criterio de
+  // "ahorro máximo" que ya usábamos, ahora sin depender del flag).
+  const abierta = await ventanaAbierta(cleanPhone, COMPANY_ID);
+  if (!abierta) {
+    console.log('⏭️ [Capelli] Calificación omitida — ventana cerrada, nunca se manda plantilla de respaldo');
     return;
   }
-
-  await enviarTemplate(cleanPhone, TEMPLATES.calificacion, [reserva.client?.name || 'Cliente', shopName, reserva.barber?.name || 'tu barbero'], COMPANY_ID, false, true, 'calificacion');
+  const mensaje = `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
+  const enviado = await enviarTextoLibreInterno(cleanPhone, mensaje, COMPANY_ID, 'calificacion');
+  if (!enviado) console.log('⚠️ [Capelli] Texto libre de calificación falló — nunca se manda plantilla de respaldo');
 }
 
 async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
