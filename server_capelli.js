@@ -726,6 +726,17 @@ async function guardarCalificacion(telefonoLocal, stars, comment) {
 // en el servidor compartido (server.js).
 // =====================================================================
 async function autoconfirmarReserva(reserva, docIdFallback, origen = 'Auto') {
+  // 💰 A pedido: un turno con seña por transferencia pendiente NUNCA se
+  // autoconfirma, sin importar qué tan cerca esté — solo lo confirma el
+  // admin a mano, cuando de verdad le llega el comprobante. Sin esto,
+  // este mecanismo (pensado para turnos que ya iban a confirmarse solos
+  // de todas formas) terminaba "confirmando" turnos cuya seña nunca
+  // llegó, justo lo que este flujo quiere evitar.
+  if (reserva.senaTransferenciaPendiente) {
+    console.log(`⏭️ [Capelli ${origen}] Turno con seña pendiente — no se autoconfirma`);
+    return false;
+  }
+
   const groupId = reserva.bookingGroupId;
 
   if (groupId) {
@@ -1169,6 +1180,45 @@ cron.schedule('*/15 * * * *', async () => {
       } catch (eDoc) {
         console.error(`❌ [Capelli CRON] Error procesando reserva ${doc.id}:`, eDoc.message);
       }
+    }
+
+    // 💰 A pedido: un turno con seña por transferencia pendiente que no
+    // se confirma dentro de 15 minutos se cancela solo — libera el
+    // horario para otro cliente que sí quiera transferir, en vez de
+    // dejarlo bloqueado indefinidamente esperando un comprobante que
+    // puede no llegar nunca. Corre siempre, sin depender de ningún
+    // flag — el toggle "Requiere Seña" ya vive por barbero.
+    try {
+      const quinceMinAtras = new Date(Date.now() - 15 * 60 * 1000);
+      const seniaPendienteSnap = await db.collection('bookings')
+        .where('locationId', 'in', LOCATION_IDS)
+        .where('senaTransferenciaPendiente', '==', true)
+        .get();
+
+      for (const doc of seniaPendienteSnap.docs) {
+        const reserva = doc.data();
+        const creado = reserva.createdAt?.toDate ? reserva.createdAt.toDate() : null;
+        if (!creado || creado > quinceMinAtras) continue; // todavía no pasaron los 15 min
+
+        const groupId = reserva.bookingGroupId;
+        if (groupId) {
+          const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
+          const batch = db.batch();
+          bloquesSnap.forEach(d => batch.update(d.ref, {
+            status: 'cancelled', senaTransferenciaPendiente: false, cancelReason: 'sena_no_confirmada',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          }));
+          await batch.commit();
+        } else {
+          await doc.ref.update({
+            status: 'cancelled', senaTransferenciaPendiente: false, cancelReason: 'sena_no_confirmada',
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          });
+        }
+        console.log(`⏰ [Capelli] Turno ${String(groupId || doc.id).slice(-5)} cancelado — seña no confirmada en 15 min`);
+      }
+    } catch (eSenia) {
+      console.error('❌ [Capelli] Error cancelando turnos con seña vencida:', eSenia.message);
     }
   } catch (error) {
     console.error('❌ [Capelli CRON] Error:', error);
