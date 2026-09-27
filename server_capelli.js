@@ -938,6 +938,49 @@ app.post('/api/reserva-completada', async (req, res) => {
   }
 });
 
+// =====================================================================
+// 💰 CONFIRMAR SEÑA POR TRANSFERENCIA — el admin la marca a mano desde
+// el panel una vez que verifica que el comprobante llegó de verdad.
+// Manda la plantilla de confirmación DIRECTO, sin intentar texto libre
+// primero — el cliente manda el comprobante por WhatsApp a un número
+// que no tiene el bot/CRM conectado, así que la ventana de 24hs nunca
+// llega a abrirse del lado del bot, y el intento de texto libre
+// terminaría cayendo a la plantilla de todos modos.
+// =====================================================================
+app.post('/api/confirmar-sena', async (req, res) => {
+  try {
+    const { bookingId } = req.body;
+    if (!bookingId) return res.status(400).json({ success: false, error: 'Falta bookingId' });
+
+    const bookingRef = db.collection('bookings').doc(bookingId);
+    const bookingSnap = await bookingRef.get();
+    if (!bookingSnap.exists) return res.status(404).json({ success: false, error: 'Reserva no encontrada' });
+
+    const realBooking = bookingSnap.data();
+    if (!(await perteneceACapelli({ booking: realBooking }))) {
+      return reenviarABarberGo('/api/confirmar-sena', req.body, res);
+    }
+
+    const numeroMeta = normalizarNumeroPY(realBooking.client?.phone);
+    if (!numeroMeta) return res.status(400).json({ success: false, error: 'El turno no tiene teléfono de cliente' });
+
+    // 🔧 A pedido: acá va DIRECTO a la plantilla, sin intentar texto
+    // libre primero — el cliente manda el comprobante a un número que
+    // no tiene el CRM/bot conectado, así que la ventana de 24hs del
+    // lado del bot nunca llega a abrirse, y el intento de texto libre
+    // siempre terminaría cayendo a la plantilla de todos modos.
+    const { shopName, mapLink } = await obtenerDatosUbicacion(realBooking.locationId);
+    const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(realBooking);
+    const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
+
+    const ok = await enviarTemplate(numeroMeta, 'reserva_confirmada_capelli_v1', variables, COMPANY_ID, false, true, 'confirmadaSenia');
+    return res.status(ok ? 200 : 500).json({ success: ok, message: 'Confirmación de seña enviada', sentBy: 'capelli' });
+  } catch (error) {
+    console.error('❌ Error en /api/confirmar-sena:', error);
+    return res.status(500).json({ success: false, error: 'Error interno del servidor' });
+  }
+});
+
 app.post('/api/admin-notificar-cancelacion', async (req, res) => {
   try {
     const { reserva } = req.body;
@@ -1152,6 +1195,18 @@ cron.schedule('*/15 * * * *', async () => {
     for (const doc of snapshot.docs) {
       try {
         const reserva = doc.data();
+
+        // 💰 A pedido: un turno que ya se confirmó con seña por
+        // transferencia no necesita recordatorio — pagar la seña YA es
+        // la confirmación fuerte de que va a venir, así que este paso
+        // extra (con sus propios botones de confirmar/cancelar) se
+        // saltea del todo. Se marca reminderSent igual, para que este
+        // chequeo no lo siga mirando en cada vuelta del cron.
+        if (reserva.paymentMethod === 'transferencia_sena') {
+          await db.collection('bookings').doc(doc.id).update({ reminderSent: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+          continue;
+        }
+
         const timeStr = reserva.startTime || reserva.time;
         if (!timeStr || !reserva.date) continue;
 
