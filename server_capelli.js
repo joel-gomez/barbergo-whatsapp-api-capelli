@@ -186,23 +186,13 @@ async function obtenerPaidUntil() {
 // que todavía se están validando (texto libre en vez de plantilla).
 // Se activa desde SuperAdmin, empresa por empresa — Capelli solo lo
 // usa si Joel lo activó explícitamente para esta empresa puntual.
-let PRUEBA_FLUJO_CACHE = { value: undefined, cachedAt: 0 };
-const PRUEBA_FLUJO_TTL_MS = 60 * 1000;
-
+// 🔧 A pedido: el Flujo WhatsApp Optimizado (texto libre en vez de plantilla
+// para confirmación/cancelación/agradecimiento, autoconfirmación de turnos
+// inminentes, etc.) YA ESTÁ VALIDADO y queda activo para TODAS las empresas.
+// Ya no depende del switch por empresa del SuperAdmin. Se mantiene la función
+// (async, igual que antes) para no tocar los ~8 lugares que la consultan.
 async function pruebaFlujoWhatsappActiva() {
-  const ahora = Date.now();
-  if (PRUEBA_FLUJO_CACHE.value !== undefined && (ahora - PRUEBA_FLUJO_CACHE.cachedAt) < PRUEBA_FLUJO_TTL_MS) {
-    return PRUEBA_FLUJO_CACHE.value;
-  }
-  try {
-    const snap = await db.collection('companies').doc(COMPANY_ID).get();
-    const activa = !!(snap.exists && snap.data().enabledFeatures?.pruebaFlujoWhatsapp);
-    PRUEBA_FLUJO_CACHE = { value: activa, cachedAt: ahora };
-    return activa;
-  } catch (e) {
-    console.error('⚠️ [Capelli] Error obteniendo pruebaFlujoWhatsapp:', e.message);
-    return false;
-  }
+  return true;
 }
 
 function obtenerCicloId(paidUntil) {
@@ -764,13 +754,12 @@ async function autoconfirmarReserva(reserva, docIdFallback, origen = 'Auto') {
     });
   }
 
+  // 🔧 A pedido: cuando un turno se autoconfirma (turno inminente) YA NO se manda
+  // ningún mensaje de WhatsApp — el cliente ve su turno confirmado en la pantalla
+  // de éxito de la app. Solo se actualiza el estado (arriba); no se envía plantilla
+  // ni se consume cupo.
   if (reserva.isPrimary !== false) {
-    const cleanPhoneAuto = normalizarNumeroPY(reserva.client?.phone);
-    const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
-    const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
-    const variables = [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink];
-    await enviarTemplate(cleanPhoneAuto, TEMPLATES.confirmada, variables, COMPANY_ID, true, true, 'confirmadaAuto');
-    console.log(`📤 [Capelli ${origen}] confirmación enviada a ${cleanPhoneAuto}`);
+    console.log(`🔕 [Capelli ${origen}] Turno autoconfirmado — sin mensaje de WhatsApp`);
   }
   return true;
 }
