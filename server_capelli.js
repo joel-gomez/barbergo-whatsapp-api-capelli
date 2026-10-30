@@ -32,7 +32,9 @@ const UMBRAL_AUTOCONFIRMA_MIN = 180;
 
 const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo-whatsapp-api-production.up.railway.app';
 
-const TEMPLATES = {
+// 🛟 Respaldo — se usa SOLO si no hay nada configurado para Capelli en
+// Firestore (whatsapp_bots), o si falla la consulta.
+const TEMPLATES_DEFAULT = {
   solicitud:      'solicitud_reserva_capelli_v1',
   confirmada:     'reserva_confirmada_capelli_v3',
   cancelada:      'reserva_cancelada_capelli_v1',
@@ -40,6 +42,85 @@ const TEMPLATES = {
   calificacion:   'calificar_barbero_capelli_v1',
   agradecimiento: 'agradecimiento_capelli_v1'
 };
+
+// =====================================================================
+// 🎛️ PLANTILLAS DINÁMICAS — igual que Cabo/Celbenz: se busca el bot de
+// Capelli por companyId en whatsapp_bots y se usan SUS nombres de
+// plantilla (campo por campo; lo que falte cae en el respaldo de arriba).
+// Caché de 60s — un cambio en el SuperAdmin tarda como máximo un minuto.
+// =====================================================================
+// 🛡️ Nombres genéricos de BarberGo. El editor viejo del SuperAdmin los
+// guardaba en whatsapp_bots aunque el cliente tuviera plantillas propias,
+// y no están aprobados en este número — si llega uno de estos se ignora
+// y se usa el respaldo de este servidor para ese campo.
+const PLANTILLAS_GENERICAS = ['solicitud_reserva_v3', 'reserva_confirmada_v2', 'reserva_cancelada_v3', 'recordatorio_turno_v3', 'recordatorio_turno_v4', 'calificar_barbero_v2', 'agradecimiento_v1'];
+function plantillaPropia(valor, respaldo) {
+  const v = String(valor || '').trim();
+  return v && !PLANTILLAS_GENERICAS.includes(v) ? v : respaldo;
+}
+
+let TEMPLATES_CACHE = { value: null, cachedAt: 0 };
+const TEMPLATES_TTL_MS = 60 * 1000;
+
+async function obtenerTemplates() {
+  const ahora = Date.now();
+  if (TEMPLATES_CACHE.value && (ahora - TEMPLATES_CACHE.cachedAt) < TEMPLATES_TTL_MS) {
+    return TEMPLATES_CACHE.value;
+  }
+  try {
+    const snap = await db.collection('whatsapp_bots').where('companyId', '==', COMPANY_ID).limit(1).get();
+    if (snap.empty) {
+      TEMPLATES_CACHE = { value: TEMPLATES_DEFAULT, cachedAt: ahora };
+      return TEMPLATES_DEFAULT;
+    }
+    const t = snap.docs[0].data().templates || {};
+    const resultado = {
+      solicitud:      plantillaPropia(t.pending,   TEMPLATES_DEFAULT.solicitud),
+      confirmada:     plantillaPropia(t.confirmed, TEMPLATES_DEFAULT.confirmada),
+      cancelada:      plantillaPropia(t.cancelled, TEMPLATES_DEFAULT.cancelada),
+      recordatorio:   plantillaPropia(t.reminder,  TEMPLATES_DEFAULT.recordatorio),
+      calificacion:   plantillaPropia(t.rating,    TEMPLATES_DEFAULT.calificacion),
+      agradecimiento: plantillaPropia(t.thanks,    TEMPLATES_DEFAULT.agradecimiento),
+    };
+    TEMPLATES_CACHE = { value: resultado, cachedAt: ahora };
+    return resultado;
+  } catch (e) {
+    console.error('⚠️ [Capelli] Error leyendo plantillas de whatsapp_bots, usando respaldo:', e.message);
+    return TEMPLATES_DEFAULT;
+  }
+}
+
+// =====================================================================
+// 💬 TEXTOS LIBRES EDITABLES — se cargan desde el SuperAdmin (BotManager,
+// campo `textos` del bot en whatsapp_bots): confirmed, cancelled, rating,
+// thanks. Si un texto está vacío se usa el de siempre escrito acá en el
+// código. Variables: {cliente} {local} {fecha} {hora} {barbero}
+// {servicio} {precio} {ticket} {ubicacion} {link}. Caché de 60s, igual
+// que las plantillas.
+// =====================================================================
+let TEXTOS_CACHE = { value: null, cachedAt: 0 };
+
+async function obtenerTextos() {
+  const ahora = Date.now();
+  if (TEXTOS_CACHE.value && (ahora - TEXTOS_CACHE.cachedAt) < 60 * 1000) return TEXTOS_CACHE.value;
+  try {
+    const snap = await db.collection('whatsapp_bots').where('companyId', '==', COMPANY_ID).limit(1).get();
+    const textos = snap.empty ? {} : (snap.docs[0].data().textos || {});
+    TEXTOS_CACHE = { value: textos, cachedAt: ahora };
+    return textos;
+  } catch (e) {
+    console.error('⚠️ [Capelli] Error leyendo textos libres de whatsapp_bots, usando los de siempre:', e.message);
+    return {};
+  }
+}
+
+// Reemplaza {variable} por su valor. Si el texto está vacío devuelve null
+// para que se use el texto de siempre escrito en el código.
+function textoPersonalizado(textos, clave, vars) {
+  const t = String(textos?.[clave] || '').trim();
+  if (!t) return null;
+  return t.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined && vars[k] !== null ? String(vars[k]) : m));
+}
 
 // =====================================================================
 // 🕐 HORA DE PARAGUAY — UTC-3 FIJO
@@ -655,10 +736,12 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, esInici
   // por aprobación de Meta — conviene que Joel lo revise antes de
   // activar el flag para más empresas.
   if (usarTextoLibre) {
-    let mensaje;
-    if (nuevoEstado === 'confirmed') {
+    const textos = await obtenerTextos();
+    let mensaje = textoPersonalizado(textos, nuevoEstado === 'confirmed' ? 'confirmed' : 'cancelled',
+      { cliente: clientName, local: shopName, fecha: formattedDate, hora: timeStr, barbero: barberName, servicio: serviceName, precio: servicePrice, ticket: tId, ubicacion: mapLink, link: shopUrl });
+    if (!mensaje && nuevoEstado === 'confirmed') {
       mensaje = `¡Turno Confirmado!\n¡Hola ${clientName}! 💈\n\nConfirmaste tu turno en ${shopName} 🙌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr} hs\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\n📍 Ubicación: ${mapLink}\n\n¡Te esperamos! 🙌\nPlataforma Gestionada por Barber Go`;
-    } else {
+    } else if (!mensaje) {
       mensaje = `Reserva Cancelada\nHola ${clientName} 👋\n\nTu turno en ${shopName} fue cancelado ❌\n\n🗓 Fecha: ${formattedDate}\n⏰ Hora: ${timeStr}\n👨\u200d🦱 Barbero: ${barberName}\n✂️ Servicio: ${serviceName}\n💰 Precio: Gs ${servicePrice}\n🎫 Ticket: #${tId}\n\nPodés reagendar tu turno cuando quieras 👇\n📲 ${shopUrl}\n\n¡Hasta pronto! 🙌\nPlataforma Gestionada por Barber Go`;
     }
     const enviado = await enviarTextoLibreInterno(numeroMeta, mensaje, COMPANY_ID, 'respuestaCliente');
@@ -666,6 +749,7 @@ async function enviarRespuestaWhatsApp(reserva, nuevoEstado, numeroMeta, esInici
     console.log('⚠️ [Capelli] Texto libre falló, usando plantilla de respaldo');
   }
 
+  const TEMPLATES = await obtenerTemplates();
   const templateName = nuevoEstado === 'confirmed' ? TEMPLATES.confirmada : TEMPLATES.cancelada;
   const linkFinal    = nuevoEstado === 'confirmed' ? mapLink : shopUrl;
   const categoria = !esIniciadoPorNegocio
@@ -678,6 +762,7 @@ async function enviarRecordatorioWhatsApp(reserva) {
   const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
   const cleanPhone = normalizarNumeroPY(reserva.client?.phone);
+  const TEMPLATES = await obtenerTemplates();
   await enviarTemplate(cleanPhone, TEMPLATES.recordatorio, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink], COMPANY_ID, false, true, 'recordatorio');
 }
 
@@ -696,7 +781,9 @@ async function enviarCalificacionWhatsApp(reserva) {
     console.log('⏭️ [Capelli] Calificación omitida — ventana cerrada, nunca se manda plantilla de respaldo');
     return;
   }
-  const mensaje = `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
+  const textos = await obtenerTextos();
+  const mensaje = textoPersonalizado(textos, 'rating', { cliente: reserva.client?.name || 'Cliente', local: shopName, barbero: reserva.barber?.name || 'tu barbero' })
+    || `Califica tu experiencia\n¡Hola ${reserva.client?.name || 'Cliente'}!\n\n💈 ¿Qué te pareció el servicio en ${shopName} con ${reserva.barber?.name || 'tu barbero'}?\n\n⭐ Tu opinión es muy importante para nosotros. Por favor, responde con una calificación del 1️⃣ al 5️⃣:\n\n😞 1️⃣ - Malo\n😐 2️⃣ - Regular\n🙂 3️⃣ - Bueno\n😊 4️⃣ - Muy bueno\n🤩 5️⃣ - Excelente\n\n💬 También puedes dejarnos un comentario sobre tu experiencia (opcional).\n\n🙌 ¡Gracias por ayudarnos a seguir mejorando y brindarte el mejor servicio!\nPlataforma Gestionada por Barber Go`;
   const enviado = await enviarTextoLibreInterno(cleanPhone, mensaje, COMPANY_ID, 'calificacion');
   if (!enviado) console.log('⚠️ [Capelli] Texto libre de calificación falló — nunca se manda plantilla de respaldo');
 }
@@ -712,11 +799,13 @@ async function enviarAgradecimientoWhatsApp(reserva, telefonoLocal) {
   // 🧪 Mismo flag de prueba que enviarRespuestaWhatsApp — mientras no
   // esté activado, cae directo a la plantilla de siempre.
   if (await pruebaFlujoWhatsappActiva()) {
-    const mensaje = `Opinión recibida correctamente.\n\nGracias por responder.`;
+    const mensaje = textoPersonalizado(await obtenerTextos(), 'thanks', {})
+      || `Opinión recibida correctamente.\n\nGracias por responder.`;
     const enviado = await enviarTextoLibreInterno(normalizarNumeroPY(telefonoLocal), mensaje, COMPANY_ID, 'agradecimiento');
     if (enviado) return;
     console.log('⚠️ [Capelli] Texto libre de agradecimiento falló, usando plantilla de respaldo');
   }
+  const TEMPLATES = await obtenerTemplates();
   await enviarTemplate(normalizarNumeroPY(telefonoLocal), TEMPLATES.agradecimiento, [], COMPANY_ID, false, false, 'agradecimiento');
 }
 
@@ -845,6 +934,7 @@ app.post('/api/enviar-mensaje', async (req, res) => {
 
     const cid = companyId || COMPANY_ID;
 
+    const TEMPLATES = await obtenerTemplates();
     const TEMPLATE_MAP = {
       'solicitud_reserva_v3':    TEMPLATES.solicitud,
       'reserva_confirmada_v2':   TEMPLATES.confirmada,
@@ -991,7 +1081,7 @@ app.post('/api/reserva-completada', async (req, res) => {
       return res.status(200).json({ success: true, message: 'No seleccionado para calificación este mes' });
     }
 
-    console.log(`💈 [Capelli] Cuenta EMPRESARIAL. Solicitando calificación con: ${TEMPLATES.calificacion}`);
+    console.log(`💈 [Capelli] Cuenta EMPRESARIAL. Solicitando calificación (texto libre)`);
     await enviarCalificacionWhatsApp(realBooking);
     await bookingRef.update({ ratingTemplateSent: true, isReviewed: false });
 
