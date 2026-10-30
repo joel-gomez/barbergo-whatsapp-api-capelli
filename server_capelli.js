@@ -646,15 +646,33 @@ async function enviarTemplate(numero, templateName, params = [], companyId = COM
 // ni cambiar el comportamiento actual. Colección compartida con
 // server.js (mismo proyecto de Firebase) — el conteo sale combinado.
 // =====================================================================
-async function contarMensajeServicio() {
+async function contarMensajeServicio(companyId = COMPANY_ID, categoria = 'otro') {
+  const inc = admin.firestore.FieldValue.increment(1);
   try {
     const hoy = fechaPY();
     await db.collection('service_text_daily').doc(hoy).set({
-      count: admin.firestore.FieldValue.increment(1),
+      count: inc,
+      ...(companyId && { porEmpresa: { [companyId]: inc } }),
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
   } catch (e) {
     console.error('⚠️ [Capelli] [Servicio] No se pudo contar mensaje de texto libre:', e.message);
+  }
+  // 📊 Por empresa y por ciclo — mismo documento de usage_monthly que las
+  // plantillas, pero en campos aparte (textoLibre / textoLibreDesglose):
+  // NO toca "count" ni el desglose de plantillas. Así el SuperAdmin ve
+  // cuántos textos libres mandó cada cliente en su ciclo y de qué tipo.
+  if (!companyId) return;
+  try {
+    const cicloId = obtenerCicloId(await obtenerPaidUntil());
+    await db.collection('usage_monthly').doc(`monthly_${companyId}_${cicloId}`).set({
+      companyId, cicloId,
+      textoLibre: inc,
+      textoLibreDesglose: { [categoria]: inc },
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (e) {
+    console.error('⚠️ [Capelli] [Servicio] No se pudo sumar texto libre al ciclo:', e.message);
   }
 }
 
@@ -710,7 +728,7 @@ async function enviarTextoLibreInterno(numero, mensaje, companyId = COMPANY_ID, 
         });
       } catch (e) { console.error('⚠️ [Capelli] [Chat] No se pudo registrar texto libre saliente:', e.message); }
 
-      await contarMensajeServicio();
+      await contarMensajeServicio(companyId, categoria);
     }
     return true;
   } catch (error) {
@@ -1028,6 +1046,9 @@ app.post('/api/enviar-texto-libre', async (req, res) => {
     } catch (e) {
       console.error('⚠️ [Capelli] [Chat] No se pudo registrar texto libre saliente:', e.message);
     }
+
+    // 📊 Texto libre escrito a mano desde el chat del panel
+    await contarMensajeServicio(cid, 'chatPanel');
 
     return res.status(200).json({ success: true });
   } catch (error) {
