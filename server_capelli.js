@@ -1311,6 +1311,37 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
+// 💸 FIX DE COSTOS (lecturas de Firestore): antes el cron hacía .get()
+// en cada vuelta y cada vez se cobraban TODOS los turnos que traía la
+// consulta, aunque fueran los mismos de la vuelta anterior. Ahora las
+// mismas consultas quedan escuchando en vivo (onSnapshot): Firestore cobra
+// la carga inicial y después solo cada turno que cambia. El cron recorre
+// la foto en memoria. Cuando cambia la fecha se reabren los escuchadores.
+// Si un escuchador falla o todavía no cargó, esa vuelta usa el .get() de antes.
+// Devuelve objetos con .docs, igual que los snapshots de .get().
+function crearTurnosEnVivo(nombre) {
+  const estado = { clave: null, unsubs: [], fotos: [] };
+  return async (clave, consultas) => {
+    if (estado.clave !== clave) {
+      estado.unsubs.forEach(unsub => unsub());
+      estado.clave = clave;
+      estado.fotos = consultas.map(() => null);
+      estado.unsubs = consultas.map((q, i) => q.onSnapshot(
+        (snap) => { if (estado.clave === clave) estado.fotos[i] = snap.docs; },
+        (err) => {
+          console.error(`⚠️ [${nombre}] Escuchador ${i} falló, se reabre en la próxima vuelta:`, err.message);
+          if (estado.clave === clave) estado.clave = null;
+        }
+      ));
+      console.log(`👂 [${nombre}] Escuchando turnos (${clave})`);
+    }
+    if (estado.fotos.length && estado.fotos.every(Boolean)) return estado.fotos.map(docs => ({ docs }));
+    return Promise.all(consultas.map(q => q.get()));
+  };
+}
+
+const turnosRecordatorio = crearTurnosEnVivo('Cron recordatorios');
+
 cron.schedule('*/2 * * * *', async () => {
   try {
     const py = horaParaguay();
@@ -1327,13 +1358,12 @@ cron.schedule('*/2 * * * *', async () => {
     // sin ese campo quedaban afuera — se filtra abajo, en el código.
     const mananaStr = fechaPY(1);
     const ahoraMs = Date.now();
-    const snaps = await Promise.all([todayStr, mananaStr].map(fecha =>
+    const snaps = await turnosRecordatorio(`${todayStr}|${mananaStr}`, [todayStr, mananaStr].map(fecha =>
       db.collection('bookings')
         .where('date', '==', fecha)
         .where('locationId', 'in', LOCATION_IDS)
         .where('status', 'in', ['pending', 'confirmed'])
         .where('isPrimary', '==', true)
-        .get()
     ));
     const gruposVistos = new Set();
 
