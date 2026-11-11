@@ -320,13 +320,24 @@ async function obtenerPaidUntil() {
   }
   try {
     const snap = await db.collection('companies').doc(COMPANY_ID).get();
-    const paidUntil = snap.exists ? (snap.data().paidUntil || null) : null;
-    PAID_UNTIL_CACHE = { value: paidUntil, cachedAt: ahora };
+    const data = snap.exists ? snap.data() : {};
+    const paidUntil = data.paidUntil || null;
+    // Se aprovecha la misma lectura para el interruptor del SuperAdmin
+    // (ver confirmacionUltimoMomentoActiva)
+    PAID_UNTIL_CACHE = { value: paidUntil, cachedAt: ahora, confirmacionUltimoMomento: !!data.enabledFeatures?.confirmacionUltimoMomento };
     return paidUntil;
   } catch (e) {
     console.error('⚠️ [Capelli] Error obteniendo paidUntil:', e.message);
     return null;
   }
+}
+
+// 📩 Interruptor del SuperAdmin "Confirmación de turnos de último momento"
+// (companies/{id}.enabledFeatures.confirmacionUltimoMomento). Usa la misma
+// lectura cacheada 60s de obtenerPaidUntil — no suma lecturas.
+async function confirmacionUltimoMomentoActiva() {
+  await obtenerPaidUntil();
+  return !!PAID_UNTIL_CACHE.confirmacionUltimoMomento;
 }
 
 // 🧪 Flag de prueba — agrupa todos los cambios de ahorro de mensajes
@@ -931,38 +942,45 @@ async function autoconfirmarReserva(reserva, docIdFallback, origen = 'Auto') {
 
   const groupId = reserva.bookingGroupId;
 
-  if (groupId) {
-    const bloquesSnap = await db.collection('bookings').where('bookingGroupId', '==', groupId).get();
-    const yaConfirmado = bloquesSnap.docs.some(d => d.data().confirmedAutomatically);
-    if (yaConfirmado) {
-      console.log(`⏭️ [Capelli ${origen}] Grupo ${String(groupId).slice(-5)} ya autoconfirmado — ignorando`);
-      return false;
-    }
-    const batch = db.batch();
-    bloquesSnap.forEach(d => batch.update(d.ref, {
+  // 🔒 Marca ATÓMICA: el listener y el cron pueden llegar al mismo turno casi
+  // a la vez. Solo la corrida que de verdad lo confirma manda el mensaje.
+  const confirmados = await db.runTransaction(async (t) => {
+    const docs = groupId
+      ? (await t.get(db.collection('bookings').where('bookingGroupId', '==', groupId))).docs
+      : [await t.get(db.collection('bookings').doc(docIdFallback))].filter(d => d.exists);
+    if (docs.length === 0 || docs.some(d => d.data().confirmedAutomatically)) return 0;
+    docs.forEach(d => t.update(d.ref, {
       status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }));
-    await batch.commit();
-    console.log(`✅ [Capelli ${origen}] ${bloquesSnap.size} bloque(s) confirmado(s)`);
-  } else {
-    if (reserva.confirmedAutomatically) {
-      console.log(`⏭️ [Capelli ${origen}] Ya autoconfirmado — ignorando`);
-      return false;
-    }
-    await db.collection('bookings').doc(docIdFallback).update({
-      status: 'confirmed', reminderSent: true, confirmedAutomatically: true,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
+    return docs.length;
+  });
+  if (!confirmados) {
+    console.log(`⏭️ [Capelli ${origen}] ${groupId ? `Grupo ${String(groupId).slice(-5)}` : 'Turno'} ya autoconfirmado — ignorando`);
+    return false;
   }
+  console.log(`✅ [Capelli ${origen}] ${confirmados} bloque(s) confirmado(s)`);
 
-  // 🔧 A pedido: cuando un turno se autoconfirma (turno inminente) YA NO se manda
-  // ningún mensaje de WhatsApp — el cliente ve su turno confirmado en la pantalla
-  // de éxito de la app. Solo se actualiza el estado (arriba); no se envía plantilla
-  // ni se consume cupo.
-  if (reserva.isPrimary !== false) {
-    console.log(`🔕 [Capelli ${origen}] Turno autoconfirmado — sin mensaje de WhatsApp`);
+  // 📩 Plantilla de reserva confirmada — SOLO con el interruptor del
+  // SuperAdmin prendido. Si no, el cliente ve su turno confirmado en la
+  // pantalla de éxito de la app y no se manda nada (ni se consume cupo).
+  if (reserva.isPrimary === false) return true;
+  if (!(await confirmacionUltimoMomentoActiva())) {
+    console.log(`🔕 [Capelli ${origen}] Turno autoconfirmado — sin mensaje de WhatsApp (interruptor apagado)`);
+    return true;
   }
+  if (!reserva.client?.phone) return true;
+  const { permitido, motivo } = await puedeEnviar(COMPANY_ID);
+  if (!permitido) {
+    console.log(`🚫 [Capelli ${origen}] Sin cupo (${motivo}) — confirmado pero sin aviso`);
+    return true;
+  }
+  const cleanPhone = normalizarNumeroPY(reserva.client.phone);
+  const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
+  const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
+  const TEMPLATES = await obtenerTemplates();
+  const ok = await enviarTemplate(cleanPhone, TEMPLATES.confirmada, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink], COMPANY_ID, true, true, 'confirmadaAuto');
+  console.log(`${ok ? '📤' : '❌'} [Capelli ${origen}] ${TEMPLATES.confirmada} → ${cleanPhone}`);
   return true;
 }
 
