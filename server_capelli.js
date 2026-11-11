@@ -231,6 +231,10 @@ async function reclamarRecordatorio(groupId, docId, slotEsperado) {
   });
 }
 
+// `porOrigen` separa en el SuperAdmin qué número consumió el alcance
+// (compartido vs. cada bot propio); `numeros` sigue siendo el total.
+const ORIGEN_ALCANCE = 'capelli';
+
 async function registrarAlcanceMeta(phone) {
   try {
     const cleanPhone = String(phone || '').replace(/\D/g, '');
@@ -238,6 +242,7 @@ async function registrarAlcanceMeta(phone) {
     const hoy = fechaPY();
     await db.collection('meta_reach_daily').doc(hoy).set({
       numeros: { [cleanPhone]: admin.firestore.FieldValue.serverTimestamp() },
+      porOrigen: { [ORIGEN_ALCANCE]: { [cleanPhone]: admin.firestore.FieldValue.serverTimestamp() } },
       updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true });
   } catch (e) {
@@ -510,16 +515,41 @@ async function reenviarABarberGo(path, body, res) {
   }
 }
 
+// 🇦🇷 Argentina: WhatsApp usa 549 + área + número (10 díg. entre los dos).
+// Se reconoce el formato local con 0 (011 2504 2000 = 11 díg., que no
+// choca con Paraguay —0 + 9 díg.— ni con Brasil —nunca empieza con 0—),
+// con el 15 del celular (011 15 2504 2000) y con 54 adelante, con o sin el 9.
+function numeroArgentino(c) {
+  if (c.length === 13 && c.startsWith('549')) return c;
+  if (c.length === 12 && c.startsWith('54')) return '549' + c.substring(2);
+  if (c.length === 11 && c.startsWith('0')) return '549' + c.substring(1);
+  if (c.length === 13 && c.startsWith('0')) {
+    for (const largoArea of [2, 3, 4]) {
+      if (c.substr(1 + largoArea, 2) === '15') return '549' + c.substring(1, 1 + largoArea) + c.substring(3 + largoArea);
+    }
+  }
+  return null;
+}
+
+// Misma lógica que normalizarNumeroPY del bot general (Paraguay, Brasil y Argentina)
 function normalizarNumeroPY(phone) {
-  let n = String(phone || '').replace(/\D/g, '');
-  if (n.startsWith('0'))         n = '595' + n.substring(1);
-  else if (!n.startsWith('595')) n = '595' + n;
+  const n = String(phone || '').replace(/\D/g, '');
+  if (n.length === 12 && n.startsWith('595')) return n; // Paraguay intl
+  if (n.length === 13 && n.startsWith('55')) return n;  // Brasil intl
+  if (n.length === 11 && /^[1-9][1-9]9\d{8}$/.test(n)) return '55' + n; // Brasil crudo
+  const ar = numeroArgentino(n);
+  if (ar) return ar; // Argentina (antes del 0 de Paraguay)
+  if (n.startsWith('0')) return '595' + n.substring(1);
+  if (!n.startsWith('595')) return '595' + n;
   return n;
 }
 
 function numeroMetaALocal(numeroMeta) {
-  if (String(numeroMeta).startsWith('595')) return '0' + String(numeroMeta).substring(3);
-  return String(numeroMeta || '');
+  const str = String(numeroMeta || '');
+  if (str.startsWith('595')) return '0' + str.substring(3);
+  if (str.startsWith('55') && str.length === 13) return str.substring(2); // Brasil
+  if (str.startsWith('549') && str.length === 13) return '0' + str.substring(3); // Argentina
+  return str;
 }
 
 async function esEmpresarial(reserva) {
