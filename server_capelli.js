@@ -37,6 +37,7 @@ const BARBERGO_SERVER_URL = process.env.BARBERGO_SERVER_URL || 'https://barbergo
 const TEMPLATES_DEFAULT = {
   solicitud:      'solicitud_reserva_capelli_v1',
   confirmada:     'reserva_confirmada_capelli_v3',
+  confirmadaAuto: 'reserva_confirmada_capelli_v3',
   cancelada:      'reserva_cancelada_capelli_v1',
   recordatorio:   'recordatorio_confirmacion_capelli_v2',
   calificacion:   'calificar_barbero_capelli_v1',
@@ -77,6 +78,8 @@ async function obtenerTemplates() {
     const resultado = {
       solicitud:      plantillaPropia(t.pending,   TEMPLATES_DEFAULT.solicitud),
       confirmada:     plantillaPropia(t.confirmed, TEMPLATES_DEFAULT.confirmada),
+      // "Confirmación de último momento" (SuperAdmin → Bots); vacía = la de confirmada
+      confirmadaAuto: plantillaPropia(t.autoConfirmed, plantillaPropia(t.confirmed, TEMPLATES_DEFAULT.confirmada)),
       cancelada:      plantillaPropia(t.cancelled, TEMPLATES_DEFAULT.cancelada),
       recordatorio:   plantillaPropia(t.reminder,  TEMPLATES_DEFAULT.recordatorio),
       calificacion:   plantillaPropia(t.rating,    TEMPLATES_DEFAULT.calificacion),
@@ -979,8 +982,8 @@ async function autoconfirmarReserva(reserva, docIdFallback, origen = 'Auto') {
   const { shopName, mapLink } = await obtenerDatosUbicacion(reserva.locationId);
   const { clientName, timeStr, barberName, tId, serviceName, servicePrice, formattedDate } = formatearReserva(reserva);
   const TEMPLATES = await obtenerTemplates();
-  const ok = await enviarTemplate(cleanPhone, TEMPLATES.confirmada, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink], COMPANY_ID, true, true, 'confirmadaAuto');
-  console.log(`${ok ? '📤' : '❌'} [Capelli ${origen}] ${TEMPLATES.confirmada} → ${cleanPhone}`);
+  const ok = await enviarTemplate(cleanPhone, TEMPLATES.confirmadaAuto, [clientName, shopName, formattedDate, timeStr, barberName, serviceName, servicePrice, tId, mapLink], COMPANY_ID, true, true, 'confirmadaAuto');
+  console.log(`${ok ? '📤' : '❌'} [Capelli ${origen}] ${TEMPLATES.confirmadaAuto} → ${cleanPhone}`);
   return true;
 }
 
