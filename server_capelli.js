@@ -1580,11 +1580,18 @@ app.listen(PORT, () => {
 // (server.js).
 // =====================================================================
 let capelliListenerReady = false;
-setTimeout(() => {
-  db.collection('bookings')
+// 💸 Solo turnos de hoy en adelante: al arrancar, Firestore cobra la carga
+// inicial completa, y sin fecha eran TODAS las reservas pending/confirmed
+// del historial en cada reinicio. Este escuchador solo usa reservas recién
+// creadas, así que el historial no hace falta. Si la consulta con fecha
+// falla (ej. índice construyéndose), se vuelve a la de antes.
+function escucharTurnosNuevos(conFecha) {
+  capelliListenerReady = false;
+  let q = db.collection('bookings')
     .where('locationId', 'in', LOCATION_IDS)
-    .where('status', 'in', ['pending', 'confirmed'])
-    .onSnapshot(async (snapshot) => {
+    .where('status', 'in', ['pending', 'confirmed']);
+  if (conFecha) q = q.where('date', '>=', fechaPY());
+  q.onSnapshot(async (snapshot) => {
       if (!capelliListenerReady) { capelliListenerReady = true; console.log('👂 [Capelli] Escuchador de turnos inminentes activo'); return; }
       for (const change of snapshot.docChanges()) {
         if (change.type !== 'added') continue;
@@ -1612,5 +1619,9 @@ setTimeout(() => {
           console.error('❌ [Capelli Listener] Error en autoconfirmación:', eAuto.message);
         }
       }
+    }, (err) => {
+      console.error(`⚠️ [Capelli] Escuchador de turnos falló${conFecha ? ', se reabre sin filtro de fecha' : ''}:`, err.message);
+      if (conFecha) escucharTurnosNuevos(false);
     });
-}, 3000);
+}
+setTimeout(() => escucharTurnosNuevos(true), 3000);
